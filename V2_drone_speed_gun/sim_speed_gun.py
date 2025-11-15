@@ -10,18 +10,23 @@ from pymavlink import mavutil
 # CONFIG
 # =========================
 
-# Change LAPTOP_IP to the machine running ArduPilot Docker
+# MAVLink connection from Jetson to SITL/MAVProxy
 MAVLINK_CONNECTION = "udp:127.0.0.1:14550"
 
+# QGC laptop IP (where QGroundControl is running)
+QGC_IP = "192.168.1.220"   # change if your laptop IP changes
+QGC_PORT = 14550
+CAR_SYSID = 42             # arbitrary system id for the car
+
 # Road and car configuration
-ROAD_HEADING_DEG = 0.0        # 0° = along +X in local frame (north in NED)
+ROAD_HEADING_DEG = 0.0        # 0° = +X (north in NED)
 CAR_SPEED_MPS = 20.0          # ~44.7 mph
 SPEED_LIMIT_MPH = 35.0
 OVER_LIMIT_MARGIN_MPH = 5.0   # how much over before we flag
 
 # Smoothing / estimator settings
-WINDOW_SIZE = 15              # how many samples to keep (for history/debug)
-LOOP_HZ = 10.0                # how fast we run the loop (Hz)
+WINDOW_SIZE = 15              # history length
+LOOP_HZ = 10.0                # main loop rate
 
 
 # =========================
@@ -37,6 +42,22 @@ def unit_vector_from_heading_deg(heading_deg):
     return np.array([math.cos(rad), math.sin(rad), 0.0], dtype=float)
 
 
+def local_to_gps(pos_vec, origin_lat, origin_lon):
+    """
+    Convert local NED (x=north, y=east) in meters to lat/lon.
+    Simple flat-earth approximation, fine for small demo distances.
+    """
+    x_north = float(pos_vec[0])
+    y_east = float(pos_vec[1])
+
+    dlat = x_north / 111_320.0
+    dlon = y_east / (111_320.0 * math.cos(math.radians(origin_lat)) + 1e-9)
+
+    lat = origin_lat + dlat
+    lon = origin_lon + dlon
+    return lat, lon
+
+
 # =========================
 # MAVLINK DRONE CLIENT
 # =========================
@@ -45,6 +66,7 @@ class MavlinkClient:
     """
     Connects to ArduPilot/PX4 over MAVLink and provides drone position
     as a 3D vector in LOCAL_POSITION_NED coordinates.
+    Also fetches origin lat/lon once for local->GPS conversion.
     """
     def __init__(self, connection_str):
         print(f"[MAVLINK] Connecting to {connection_str} ...")
@@ -54,12 +76,13 @@ class MavlinkClient:
               self.master.target_system, "Component:", self.master.target_component)
 
         self.last_pos_vec = None
+        self.origin_lat = None
+        self.origin_lon = None
 
     def get_drone_position_vec(self):
         """
-        Returns np.array([x, y, z]) in meters, where x/y/z are taken from
-        LOCAL_POSITION_NED. z is flipped to be "up" positive.
-        Returns last known value if no new message.
+        Returns np.array([x, y, z]) in meters, from LOCAL_POSITION_NED.
+        z is flipped to be "up" positive.
         """
         msg = self.master.recv_match(type="LOCAL_POSITION_NED",
                                      blocking=True, timeout=1.0)
@@ -67,7 +90,6 @@ class MavlinkClient:
             return self.last_pos_vec
 
         # LOCAL_POSITION_NED: x=north, y=east, z=down (m)
-        # We'll flip z so that positive is "up"
         self.last_pos_vec = np.array([
             float(msg.x),
             float(msg.y),
@@ -75,6 +97,25 @@ class MavlinkClient:
         ], dtype=float)
 
         return self.last_pos_vec
+
+    def get_origin_latlon(self):
+        """
+        Get the EKF origin lat/lon once using GLOBAL_POSITION_INT.
+        """
+        if self.origin_lat is not None and self.origin_lon is not None:
+            return self.origin_lat, self.origin_lon
+
+        print("[MAVLINK] Waiting for GLOBAL_POSITION_INT for origin lat/lon...")
+        msg = self.master.recv_match(type="GLOBAL_POSITION_INT",
+                                     blocking=True, timeout=10.0)
+        if msg is None:
+            raise RuntimeError("No GLOBAL_POSITION_INT received to set origin")
+
+        self.origin_lat = msg.lat * 1e-7
+        self.origin_lon = msg.lon * 1e-7
+
+        print(f"[MAVLINK] Origin lat/lon: {self.origin_lat:.7f}, {self.origin_lon:.7f}")
+        return self.origin_lat, self.origin_lon
 
 
 # =========================
@@ -151,8 +192,20 @@ class PositionSpeedEstimator:
 # =========================
 
 def main():
-    # Connect to MAVLink (ArduPilot Docker or real FC)
+    # Connect to MAVLink (SITL / real FC)
     mav = MavlinkClient(MAVLINK_CONNECTION)
+
+    # Get origin lat/lon so we can put the car on the map
+    origin_lat, origin_lon = mav.get_origin_latlon()
+    print(f"[SIM] Using origin lat/lon {origin_lat:.7f}, {origin_lon:.7f}")
+
+    # Create a MAVLink connection from Jetson directly to QGC for the car
+    car_link = mavutil.mavlink_connection(
+        f"udpout:{QGC_IP}:{QGC_PORT}",
+        source_system=CAR_SYSID,
+        source_component=1,
+    )
+    print(f"[CAR] Sending car MAVLink to {QGC_IP}:{QGC_PORT} as sysid {CAR_SYSID}")
 
     # Define a simple road and car in local frame
     # Road origin at (100, 0, 0): 100 m "ahead" in +X from NED origin.
@@ -175,6 +228,10 @@ def main():
     prev_drone_pos = None
     prev_drone_t = None
 
+    t_start = time.time()
+    last_car_hb = 0.0
+    car_heading_cdeg = int((ROAD_HEADING_DEG % 360.0) * 100)
+
     try:
         while True:
             t_loop_start = time.time()
@@ -186,7 +243,7 @@ def main():
                 time.sleep(0.1)
                 continue
 
-            drone_alt = float(drone_pos[2])  # z (up) in meters (for later use if needed)
+            drone_alt = float(drone_pos[2])  # z (up) in meters
 
             # 2) Get car position vector from simulator
             car_state = car.get_state()
@@ -196,6 +253,7 @@ def main():
             # Use car timestamp as our "now" for motion estimates
             t_now = t_car
 
+            # Estimate drone horizontal velocity and heading
             drone_heading_deg = None
             drone_speed_mps = 0.0
 
@@ -203,10 +261,9 @@ def main():
                 dt = t_now - prev_drone_t
                 if dt > 0:
                     dpos = drone_pos - prev_drone_pos
-                    # only horizontal motion (x,y)
-                    vx, vy = dpos[0] / dt, dpos[1] / dt
+                    vx, vy = dpos[0] / dt, dpos[1] / dt   # x=north, y=east
                     drone_speed_mps = math.sqrt(vx * vx + vy * vy)
-                    heading_rad = math.atan2(vy, vx)
+                    heading_rad = math.atan2(vy, vx)      # atan2(east, north)
                     drone_heading_deg = (math.degrees(heading_rad) + 360.0) % 360.0
 
             prev_drone_pos = drone_pos.copy()
@@ -225,7 +282,6 @@ def main():
                 err_mph = est_mph - true_mph
                 over = est_mph > (SPEED_LIMIT_MPH + OVER_LIMIT_MARGIN_MPH)
 
-                # Fallbacks if drone isn't really moving yet
                 heading_str = "n/a"
                 if drone_heading_deg is not None:
                     heading_str = f"{drone_heading_deg:5.1f}°"
@@ -238,6 +294,40 @@ def main():
                     f"err {err_mph:5.1f} mph   "
                     f"OVER={over}"
                 )
+
+            # 5) Send car as a fake MAVLink ground vehicle to QGC
+            #    a) heartbeat once per second
+            if t_now - last_car_hb > 1.0:
+                car_link.mav.heartbeat_send(
+                    mavutil.mavlink.MAV_TYPE_GROUND_ROVER,
+                    mavutil.mavlink.MAV_AUTOPILOT_GENERIC,
+                    0, 0,
+                    mavutil.mavlink.MAV_STATE_ACTIVE,
+                )
+                last_car_hb = t_now
+
+            #    b) position as GLOBAL_POSITION_INT
+            car_lat, car_lon = local_to_gps(car_pos, origin_lat, origin_lon)
+
+            car_link.mav.global_position_int_send(
+                int((t_now - t_start) * 1000),   # time_boot_ms
+                int(car_lat * 1e7),
+                int(car_lon * 1e7),
+                0,          # alt (mm)
+                0,          # relative alt (mm)
+                0, 0, 0,    # vx, vy, vz (cm/s)
+                car_heading_cdeg,
+            )
+
+            #    c) VFR_HUD so QGC can show car speed
+            car_link.mav.vfr_hud_send(
+                float(CAR_SPEED_MPS),  # airspeed
+                float(CAR_SPEED_MPS),  # groundspeed
+                int(ROAD_HEADING_DEG),
+                0,                     # throttle
+                0.0,                   # alt
+                0.0,                   # climb
+            )
 
             # Simple fixed loop rate
             elapsed = time.time() - t_loop_start
