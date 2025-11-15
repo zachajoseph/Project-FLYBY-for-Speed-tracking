@@ -172,6 +172,9 @@ def main():
     print("[SIM] Starting loop. Press Ctrl+C to quit.")
     dt_target = 1.0 / LOOP_HZ
 
+    prev_drone_pos = None
+    prev_drone_t = None
+
     try:
         while True:
             t_loop_start = time.time()
@@ -183,12 +186,31 @@ def main():
                 time.sleep(0.1)
                 continue
 
-            drone_alt = float(drone_pos[2])  # z (up) in meters
+            drone_alt = float(drone_pos[2])  # z (up) in meters (for later use if needed)
 
             # 2) Get car position vector from simulator
             car_state = car.get_state()
             t_car = car_state["t"]
             car_pos = car_state["pos_vec"]
+
+            # Use car timestamp as our "now" for motion estimates
+            t_now = t_car
+
+            drone_heading_deg = None
+            drone_speed_mps = 0.0
+
+            if prev_drone_pos is not None and prev_drone_t is not None:
+                dt = t_now - prev_drone_t
+                if dt > 0:
+                    dpos = drone_pos - prev_drone_pos
+                    # only horizontal motion (x,y)
+                    vx, vy = dpos[0] / dt, dpos[1] / dt
+                    drone_speed_mps = math.sqrt(vx * vx + vy * vy)
+                    heading_rad = math.atan2(vy, vx)
+                    drone_heading_deg = (math.degrees(heading_rad) + 360.0) % 360.0
+
+            prev_drone_pos = drone_pos.copy()
+            prev_drone_t = t_now
 
             # 3) Compute LOS range (for debug/info)
             delta = car_pos - drone_pos
@@ -198,15 +220,23 @@ def main():
             v_road_mps = speed_estimator.update(t_car, car_pos)
 
             if v_road_mps is not None:
-                speed_mph = v_road_mps * 2.23694
-                over = speed_mph > (SPEED_LIMIT_MPH + OVER_LIMIT_MARGIN_MPH)
+                est_mph = v_road_mps * 2.23694
+                true_mph = CAR_SPEED_MPS * 2.23694
+                err_mph = est_mph - true_mph
+                over = est_mph > (SPEED_LIMIT_MPH + OVER_LIMIT_MARGIN_MPH)
+
+                # Fallbacks if drone isn't really moving yet
+                heading_str = "n/a"
+                if drone_heading_deg is not None:
+                    heading_str = f"{drone_heading_deg:5.1f}°"
 
                 print(
-                    f"Alt: {drone_alt:5.1f} m | "
-                    f"Range: {range_m:6.1f} m | "
-                    f"Speed: {speed_mph:5.1f} mph | "
-                    f"Limit: {SPEED_LIMIT_MPH} mph | "
-                    f"OVER: {over}"
+                    f"[SpeedGun] "
+                    f"Drone (heading {heading_str}, {drone_speed_mps:4.1f} m/s)   "
+                    f"Car: est {est_mph:5.1f} mph   "
+                    f"true {true_mph:5.1f} mph   "
+                    f"err {err_mph:5.1f} mph   "
+                    f"OVER={over}"
                 )
 
             # Simple fixed loop rate
