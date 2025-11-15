@@ -19,8 +19,8 @@ CAR_SPEED_MPS = 20.0          # ~44.7 mph
 SPEED_LIMIT_MPH = 35.0
 OVER_LIMIT_MARGIN_MPH = 5.0   # how much over before we flag
 
-# Smoothing / regression settings
-WINDOW_SIZE = 15              # number of samples in regression window
+# Smoothing / estimator settings
+WINDOW_SIZE = 15              # how many samples to keep (for history/debug)
 LOOP_HZ = 10.0                # how fast we run the loop (Hz)
 
 
@@ -28,7 +28,7 @@ LOOP_HZ = 10.0                # how fast we run the loop (Hz)
 # UTILITIES
 # =========================
 
-def unit_vector_from_heading_deg(heading_deg: float) -> np.ndarray:
+def unit_vector_from_heading_deg(heading_deg):
     """
     Heading in degrees -> unit vector in 2D (x, y, 0).
     Here we treat heading=0 as +X, heading=90 as +Y.
@@ -46,7 +46,7 @@ class MavlinkClient:
     Connects to ArduPilot/PX4 over MAVLink and provides drone position
     as a 3D vector in LOCAL_POSITION_NED coordinates.
     """
-    def __init__(self, connection_str: str):
+    def __init__(self, connection_str):
         print(f"[MAVLINK] Connecting to {connection_str} ...")
         self.master = mavutil.mavlink_connection(connection_str)
         self.master.wait_heartbeat()
@@ -55,10 +55,11 @@ class MavlinkClient:
 
         self.last_pos_vec = None
 
-    def get_drone_position_vec(self) -> np.ndarray | None:
+    def get_drone_position_vec(self):
         """
         Returns np.array([x, y, z]) in meters, where x/y/z are taken from
         LOCAL_POSITION_NED. z is flipped to be "up" positive.
+        Returns last known value if no new message.
         """
         msg = self.master.recv_match(type="LOCAL_POSITION_NED",
                                      blocking=True, timeout=1.0)
@@ -87,15 +88,15 @@ class CarSim:
     - Road defined by origin vector + heading.
     """
     def __init__(self,
-                 road_origin_vec: np.ndarray,
-                 road_heading_deg: float,
-                 speed_mps: float):
+                 road_origin_vec,
+                 road_heading_deg,
+                 speed_mps):
         self.origin = road_origin_vec
         self.dir_vec = unit_vector_from_heading_deg(road_heading_deg)
         self.speed_mps = speed_mps
         self.t0 = time.time()
 
-    def get_state(self) -> dict:
+    def get_state(self):
         """
         Returns:
         {
@@ -118,14 +119,13 @@ class PositionSpeedEstimator:
     """
     Uses a vector of car positions over time to estimate speed along the road.
     - Projects car position onto road direction.
-    - Runs linear regression on (t, projected_pos) over a window.
+    - Uses finite difference on the last two samples.
     """
-    def __init__(self, road_heading_deg: float, window_size: int = 15):
+    def __init__(self, road_heading_deg, window_size=15):
         self.dir_vec = unit_vector_from_heading_deg(road_heading_deg)
-        self.window_size = window_size
         self.samples = deque(maxlen=window_size)  # (t, s_along_road_m)
 
-    def update(self, t: float, car_pos_vec: np.ndarray) -> float | None:
+    def update(self, t, car_pos_vec):
         """
         Add a new (t, car_pos_vec) sample and return estimated
         road speed in m/s, or None if not enough samples yet.
@@ -134,17 +134,15 @@ class PositionSpeedEstimator:
         s = float(np.dot(car_pos_vec, self.dir_vec))
         self.samples.append((t, s))
 
-        if len(self.samples) < 3:
+        if len(self.samples) < 2:
             return None
 
-        ts = np.array([p[0] for p in self.samples], dtype=float)
-        ss = np.array([p[1] for p in self.samples], dtype=float)
+        (t1, s1), (t2, s2) = self.samples[-2], self.samples[-1]
+        dt = t2 - t1
+        if dt <= 0:
+            return None
 
-        # Linear regression: s(t) ≈ a * t + b
-        A = np.vstack([ts, np.ones_like(ts)]).T
-        a, b = np.linalg.lstsq(A, ss, rcond=None)[0]
-
-        v_road_mps = float(a)
+        v_road_mps = (s2 - s1) / dt
         return v_road_mps
 
 
@@ -153,7 +151,7 @@ class PositionSpeedEstimator:
 # =========================
 
 def main():
-    # Connect to MAVLink (ArduPilot Docker)
+    # Connect to MAVLink (ArduPilot Docker or real FC)
     mav = MavlinkClient(MAVLINK_CONNECTION)
 
     # Define a simple road and car in local frame
@@ -185,6 +183,8 @@ def main():
                 time.sleep(0.1)
                 continue
 
+            drone_alt = float(drone_pos[2])  # z (up) in meters
+
             # 2) Get car position vector from simulator
             car_state = car.get_state()
             t_car = car_state["t"]
@@ -202,6 +202,7 @@ def main():
                 over = speed_mph > (SPEED_LIMIT_MPH + OVER_LIMIT_MARGIN_MPH)
 
                 print(
+                    f"Alt: {drone_alt:5.1f} m | "
                     f"Range: {range_m:6.1f} m | "
                     f"Speed: {speed_mph:5.1f} mph | "
                     f"Limit: {SPEED_LIMIT_MPH} mph | "
