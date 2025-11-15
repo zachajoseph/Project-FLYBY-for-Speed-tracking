@@ -1,281 +1,510 @@
 #!/usr/bin/env python3
 """
-Drone-based car speed estimation simulation.
+3D drone–car speed estimation using range + gimbal (R, beta, gamma),
+with realistic, bounded acceleration on the car and a moving drone.
 
-Simulates a drone at fixed height looking at a car moving on a straight road.
-Generates synthetic sensor data:
-    - H: drone height above ground (m)
-    - R: slant range from drone to car (m)
-    - theta_ground: elevation angle from ground plane to line-of-sight (rad)
-    - theta_drone: drone pitch angle (rad)
+Key features:
+- Drone moves with the car in (x, y), trying to keep up.
+- Drone height is bounded between 50 m and 130 m.
+- Drone outputs its own speed (m/s) and heading (deg).
+- Car moves on the ground in (x, y); speed is NOT constant:
+    * It evolves as a random walk in speed.
+    * Max speed change is limited to max_speed_change_mph_per_s (e.g. 5 mph/s).
+- From true drone/car positions we generate synthetic sensor readings:
+    R     : range
+    beta  : elevation from straight down (nadir)
+    gamma : azimuth around vertical axis
+- Add Gaussian noise to R, beta, gamma.
+- Reconstruct relative vector from sensor readings (full 3D).
+- Convert to estimated car ground positions and estimate speed from
+  ground displacement over time.
 
-Uses basic trigonometry to reconstruct the car's ground position and estimate
-its speed, then compares true vs estimated values and visualizes the result.
+Internal units: meters, seconds, m/s.
+Displayed speeds: mph.
 """
 
 import numpy as np
 import matplotlib.pyplot as plt
 
+# Conversion constant: meters/second -> miles/hour
+MPS_TO_MPH = 3600.0 / 1609.344  # ≈ 2.23693629
 
-def simulate_scene(params):
+
+# ---------- Geometry helpers ----------
+
+def sensor_from_truth(drone_pos, car_pos):
     """
-    Simulate the drone + car scenario and generate synthetic sensor readings.
+    Given true drone and car positions in WORLD frame, compute
+    ideal sensor readings:
+
+    drone_pos: (N, 3)
+    car_pos:   (N, 3)
 
     Returns:
-        t:             (N,) time array
-        x_true:        (N,) true car ground positions along the road (m)
-        sensor: dict with:
-            - H:                   scalar, drone height (m)
-            - R:                   (N,) noisy slant range (m)
-            - theta_ground:        (N,) noisy elevation angle (rad)
-            - theta_drone:         (N,) noisy drone pitch (rad)
-            - R_true:              (N,) true slant range (m)
-            - theta_ground_true:   (N,) true elevation angle (rad)
-            - theta_drone_true:    (N,) true drone pitch (rad)
+        R_true     : (N,) range [m]
+        beta_true  : (N,) elevation from straight down [rad]
+        gamma_true : (N,) azimuth around z axis [rad]
     """
-    H = params["H"]  # drone height above ground (m)
-    v_car = params["car_speed"]  # car true speed (m/s)
-    duration = params["duration"]  # total sim time (s)
-    dt = params["dt"]  # time step (s)
+    rel = car_pos - drone_pos  # (N, 3)
+    dx = rel[:, 0]
+    dy = rel[:, 1]
+    dz = rel[:, 2]
 
-    range_noise_std = params["range_noise_std"]  # m
-    angle_noise_std = np.deg2rad(params["angle_noise_std_deg"])  # rad
-    pitch_noise_std = np.deg2rad(params["pitch_noise_std_deg"])  # rad
+    R_true = np.sqrt(dx**2 + dy**2 + dz**2)
 
-    pitch_amp = np.deg2rad(params["pitch_amplitude_deg"])  # rad
-    pitch_freq = params["pitch_frequency_hz"]  # Hz
+    # Elevation from straight down (nadir):
+    # down vector is (0, 0, -1), so cos(beta) = (v · down) / |v| = (-dz) / R
+    beta_true = np.arccos(np.clip(-dz / R_true, -1.0, 1.0))
 
-    # Time vector
-    N = int(duration / dt) + 1
-    t = np.linspace(0.0, duration, N)
+    # Azimuth in x–y plane
+    gamma_true = np.arctan2(dy, dx)
 
-    # True car position: moves along +x axis, ground plane (z=0)
-    x_true = v_car * t  # (N,)
+    return R_true, beta_true, gamma_true
 
-    # Drone fixed in x-y; directly above origin at height H: (0, 0, H)
-    # Car at (x_true, 0, 0)
-    # Vector from drone to car: (x_true, 0, -H)
-    # True slant range
-    R_true = np.sqrt(x_true**2 + H**2)
 
-    # True elevation angle from ground plane to line-of-sight:
-    # theta_ground_true = atan2(vertical, horizontal) = atan2(H, x_true)
-    # This is defined as a positive angle between ground plane and LOS.
-    # When x_true increases, theta decreases.
-    # We avoid x=0 at t=0 by just letting atan2 handle it.
-    theta_ground_true = np.arctan2(H, np.maximum(x_true, 1e-6))
+def rel_vec_from_sensor(R, beta, gamma):
+    """
+    Reconstruct drone->car vector in DRONE frame from sensor readings.
+    In this sim we assume drone frame == world frame (no rotation).
 
-    # True drone pitch (e.g., small sinusoid as it tracks the car)
-    # Positive pitch = nose up.
-    theta_drone_true = pitch_amp * np.sin(2.0 * np.pi * pitch_freq * t)
+    Inputs (arrays, same length):
+        R     : range [m]
+        beta  : elevation from straight down [rad]
+        gamma : azimuth around z [rad]
 
-    # Add Gaussian noise to measurements
+    Returns:
+        rel_vec: (N, 3) relative vectors [m] in drone/world frame
+    """
+    R = np.asarray(R, dtype=float)
+    beta = np.asarray(beta, dtype=float)
+    gamma = np.asarray(gamma, dtype=float)
+
+    dx = R * np.sin(beta) * np.cos(gamma)
+    dy = R * np.sin(beta) * np.sin(gamma)
+    dz = -R * np.cos(beta)
+
+    rel_vec = np.stack([dx, dy, dz], axis=-1)
+    return rel_vec
+
+
+# ---------- Simulation ----------
+
+def simulate_scene_with_sensor(params):
+    """
+    Simulate drone + car motion and generate sensor readings with noise.
+
+    Car speed model:
+    - Start at nominal speed v_nom [m/s].
+    - Every sample (T = 1 / sample_rate_hz), speed changes by:
+        dv ∈ {0, +dv_max, -dv_max}
+      where dv_max = a_max * T and a_max is derived from
+      max_speed_change_mph_per_s.
+    - Speed is clamped to [0, v_max] to avoid nonsense.
+
+    Drone motion:
+    - Drone attempts to follow the car in the x–y plane.
+    - Uses a simple proportional controller on ground distance to car.
+    - Has its own max ground speed (drone_max_speed).
+    - Drone height is allowed to wobble slightly but is clamped to [H_min, H_max].
+
+    Params keys:
+        H                        : nominal drone height [m]
+        H_min, H_max             : min/max drone height [m]
+        car_speed                : nominal car speed [m/s]
+        sample_rate_hz           : sampling rate [Hz]
+        duration                 : total simulation time [s]
+        lateral_amp              : amplitude of lateral motion [m]
+        lateral_freq_hz          : frequency of lateral motion [Hz]
+        max_speed_change_mph_per_s: max allowed car speed change per second [mph/s]
+        range_noise_std          : std dev of range noise [m]
+        beta_noise_std_deg       : std dev of beta noise [deg]
+        gamma_noise_std_deg      : std dev of gamma noise [deg]
+        drone_max_speed          : max drone ground speed [m/s]
+        drone_kp_follow          : proportional gain for following [1/s]
+        drone_alt_step_std       : stddev of vertical random step per sample [m]
+
+    Returns:
+        t                 : (N,) timestamps [s]
+        drone_pos         : (N, 3) true drone positions [m]
+        car_pos_true      : (N, 3) true car positions [m]
+        rel_true          : (N, 3) true relative vectors (drone->car) [m]
+        rel_meas          : (N, 3) reconstructed relative vectors from noisy sensor [m]
+        v_true            : (N,)  true car speed [m/s]
+        drone_speed       : (N,)  drone ground speed [m/s]
+        drone_heading_deg : (N,)  drone heading [deg, 0–360)
+    """
+    H_nom = params["H"]
+    H_min = params.get("H_min", 50.0)
+    H_max = params.get("H_max", 130.0)
+
+    v_nom = params["car_speed"]               # nominal car speed [m/s]
+    sr = params["sample_rate_hz"]
+    T = 1.0 / sr
+    duration = params["duration"]
+
+    lateral_amp = params.get("lateral_amp", 10.0)
+    lateral_freq = params.get("lateral_freq_hz", 0.05)
+
+    max_speed_change_mph_per_s = params.get("max_speed_change_mph_per_s", 5.0)
+    mph_to_mps = 0.44704
+    a_max = max_speed_change_mph_per_s * mph_to_mps  # [m/s^2]
+    max_dv_per_step = a_max * T                      # [m/s] per sample
+
+    range_noise_std = params.get("range_noise_std", 0.5)
+    beta_noise_std = np.deg2rad(params.get("beta_noise_std_deg", 0.5))
+    gamma_noise_std = np.deg2rad(params.get("gamma_noise_std_deg", 1.0))
+
+    drone_max_speed = params.get("drone_max_speed", 35.0)  # [m/s]
+    drone_kp_follow = params.get("drone_kp_follow", 0.5)   # [1/s]
+    drone_alt_step_std = params.get("drone_alt_step_std", 1.0)  # [m] per sample
+
+    # Time vector aligned with sampling period
+    N = int(duration / T) + 1
+    t = np.arange(N, dtype=float) * T
+
+    # ----- Car speed as bounded random walk -----
+    v_true = np.zeros(N, dtype=float)
+    v_true[0] = v_nom  # start near nominal speed
+
+    for n in range(1, N):
+        dv_choice = np.random.choice([0.0, max_dv_per_step, -max_dv_per_step])
+        v_true[n] = v_true[n - 1] + dv_choice
+        v_true[n] = np.clip(v_true[n], 0.0, 40.0)  # cap ~90 mph
+
+    # Integrate speed to get x position of car
+    x_car = np.zeros(N, dtype=float)
+    for n in range(1, N):
+        x_car[n] = x_car[n - 1] + v_true[n - 1] * T
+
+    # Lateral motion (simulate turns)
+    y_car = lateral_amp * np.sin(2.0 * np.pi * lateral_freq * t)
+    z_car = np.zeros_like(x_car)
+
+    car_pos_true = np.stack([x_car, y_car, z_car], axis=-1)
+
+    # ----- Drone motion -----
+    drone_pos = np.zeros((N, 3), dtype=float)
+
+    # Initial drone xy: start behind the car, within ~100 m
+    drone_xy = np.zeros((N, 2), dtype=float)
+    drone_xy[0, 0] = x_car[0] - 60.0  # 60 m behind along x
+    drone_xy[0, 1] = y_car[0]
+
+    # Initial altitude, clamped
+    drone_z = np.zeros(N, dtype=float)
+    drone_z[0] = np.clip(H_nom, H_min, H_max)
+
+    drone_speed = np.zeros(N, dtype=float)
+    drone_heading_deg = np.zeros(N, dtype=float)
+
+    for n in range(1, N):
+        pos_d = drone_xy[n - 1]
+        pos_c = car_pos_true[n - 1, :2]
+        diff = pos_c - pos_d
+        dist = np.linalg.norm(diff)
+
+        if dist > 1e-3:
+            # Proportional controller on distance, limited by drone_max_speed
+            desired_speed = min(drone_max_speed, drone_kp_follow * dist)
+            direction = diff / dist
+            step = desired_speed * T * direction
+            drone_xy[n] = pos_d + step
+            drone_speed[n] = desired_speed
+
+            heading_rad = np.arctan2(step[1], step[0])
+            heading_deg = (np.degrees(heading_rad) + 360.0) % 360.0
+            drone_heading_deg[n] = heading_deg
+        else:
+            drone_xy[n] = pos_d
+            drone_speed[n] = 0.0
+            drone_heading_deg[n] = drone_heading_deg[n - 1]
+
+        # Altitude random walk with clamp
+        dz = np.random.normal(0.0, drone_alt_step_std)
+        drone_z[n] = np.clip(drone_z[n - 1] + dz, H_min, H_max)
+
+    # Fill first speed/heading nicely
+    drone_speed[0] = drone_speed[1]
+    drone_heading_deg[0] = drone_heading_deg[1]
+
+    # Assemble 3D drone positions
+    drone_pos[:, 0:2] = drone_xy
+    drone_pos[:, 2] = drone_z
+
+    # True relative vector
+    rel_true = car_pos_true - drone_pos
+
+    # Ideal sensor readings
+    R_true, beta_true, gamma_true = sensor_from_truth(drone_pos, car_pos_true)
+
+    # Add noise
     R_meas = R_true + np.random.normal(0.0, range_noise_std, size=N)
-    R_meas = np.maximum(R_meas, 0.1)  # avoid non-physical negative/zero ranges
+    beta_meas = beta_true + np.random.normal(0.0, beta_noise_std, size=N)
+    gamma_meas = gamma_true + np.random.normal(0.0, gamma_noise_std, size=N)
 
-    theta_ground_meas = theta_ground_true + np.random.normal(
-        0.0, angle_noise_std, size=N
+    # Reconstruct relative vector from noisy sensor readings
+    rel_meas = rel_vec_from_sensor(R_meas, beta_meas, gamma_meas)
+
+    return (
+        t,
+        drone_pos,
+        car_pos_true,
+        rel_true,
+        rel_meas,
+        v_true,
+        drone_speed,
+        drone_heading_deg,
     )
 
-    theta_drone_meas = theta_drone_true + np.random.normal(
-        0.0, pitch_noise_std, size=N
-    )
 
-    sensor = {
-        "H": H,
-        "R": R_meas,
-        "theta_ground": theta_ground_meas,
-        "theta_drone": theta_drone_meas,
-        "R_true": R_true,
-        "theta_ground_true": theta_ground_true,
-        "theta_drone_true": theta_drone_true,
-    }
+# ---------- Speed estimation from positions ----------
 
-    return t, x_true, sensor
-
-
-def estimate_positions(sensor, params):
+def estimate_speed_instantaneous_from_positions(pos_xy, sample_rate_hz):
     """
-    Reconstruct car ground position (x) from noisy sensor readings.
+    Instantaneous speed from ground positions:
 
-    Uses H, R, and theta_ground with basic trigonometry.
+        v[n] ≈ ||P_xy[n] - P_xy[n-1]|| / T
 
-    Geometry (2D vertical slice):
-        - Drone at (0, H)
-        - Car at (x, 0)
-        - Slant range: R = sqrt(x^2 + H^2)
-        - Elevation angle from ground plane: theta = atan2(H, x)
-
-    From this, we have:
-        x = R * cos(theta) = H / tan(theta) = sqrt(R^2 - H^2)
-
-    We'll combine two independent estimates:
-        x_from_range = sqrt(R^2 - H^2)
-        x_from_angle = H / tan(theta)
-
-    and average them to get a slightly more robust estimate in the presence of
-    noise.
-    """
-    H = sensor["H"]  # scalar
-    R = sensor["R"]  # (N,)
-    theta = sensor["theta_ground"]  # (N,)
-
-    # Ensure H is treated as array for broadcasting
-    H_arr = np.full_like(R, H)
-
-    # 1) Estimate from range and height: x = sqrt(R^2 - H^2)
-    under_sqrt = R**2 - H_arr**2
-    under_sqrt = np.maximum(under_sqrt, 0.0)  # guard against negative due to noise
-    x_from_range = np.sqrt(under_sqrt)
-
-    # 2) Estimate from elevation angle and height: x = H / tan(theta)
-    # Avoid tan(0) blowup by clipping the angle.
-    min_angle_deg = 5.0
-    max_angle_deg = 85.0
-    theta_clipped = np.clip(
-        theta, np.deg2rad(min_angle_deg), np.deg2rad(max_angle_deg)
-    )
-    x_from_angle = H_arr / np.tan(theta_clipped)
-
-    # Combine the two estimates
-    x_est = 0.5 * (x_from_range + x_from_angle)
-
-    return x_est
-
-
-def estimate_speed(positions, dt):
-    """
-    Estimate speed from positions using finite differences.
-
-    positions: (N,) array of x positions
-    dt:        time step
-
+    pos_xy: (N, 2) ground positions [m]
     Returns:
-        v_est: (N,) estimated speed at each time step.
+        v_inst_mps: (N,) speed [m/s]
     """
-    v_est = np.zeros_like(positions)
-    v_est[1:] = np.diff(positions) / dt
-    if len(v_est) > 1:
-        v_est[0] = v_est[1]
-    return v_est
+    pos_xy = np.asarray(pos_xy, dtype=float)
+    T = 1.0 / sample_rate_hz
+    N = pos_xy.shape[0]
+
+    v_inst = np.zeros(N, dtype=float)
+    if N > 1:
+        diffs = pos_xy[1:] - pos_xy[:-1]
+        step_dist = np.linalg.norm(diffs, axis=1)
+        v_inst[1:] = step_dist / T
+        v_inst[0] = v_inst[1]
+
+    return v_inst
 
 
-def run_noise_sweep(base_params, range_noise_levels):
+def estimate_speed_windowed_from_positions(pos_xy, sample_rate_hz, window_sec):
     """
-    Extra: run simulation for multiple range noise levels and see
-    how the average speed estimation error changes.
+    Windowed speed estimate:
 
-    Returns:
-        noise_levels: list of noise std (m)
-        errors:       list of absolute speed errors (m/s)
+        v_win[n] = ||P_xy[n] - P_xy[n-Nw]|| / (Nw * T)
+
+    where:
+        T  = 1 / sample_rate_hz
+        Nw = round(window_sec / T)
     """
-    errors = []
+    pos_xy = np.asarray(pos_xy, dtype=float)
+    T = 1.0 / sample_rate_hz
+    Nw = max(1, int(round(window_sec / T)))
+    N = pos_xy.shape[0]
 
-    for rn in range_noise_levels:
+    v_win = np.full(N, np.nan, dtype=float)
+
+    for n in range(Nw, N):
+        n0 = n - Nw
+        disp = pos_xy[n] - pos_xy[n0]
+        dist = np.linalg.norm(disp)
+        v_win[n] = dist / (Nw * T)
+
+    valid = np.where(~np.isnan(v_win))[0]
+    if len(valid) > 0:
+        first = valid[0]
+        v_win[:first] = v_win[first]
+
+    return v_win
+
+
+# ---------- Robustness vs noise ----------
+
+def evaluate_noise_robustness(base_params, noise_levels_range, window_sec):
+    """
+    Evaluate how windowed speed estimation accuracy degrades as
+    RANGE noise increases.
+
+    Compare windowed estimated speed vs windowed true speed (derived from true positions).
+    """
+    accuracies = []
+    sr = base_params["sample_rate_hz"]
+
+    for sigma_R in noise_levels_range:
         params = base_params.copy()
-        params["range_noise_std"] = rn
+        params["range_noise_std"] = sigma_R
 
-        t, x_true, sensor = simulate_scene(params)
-        x_est = estimate_positions(sensor, params)
-        v_est = estimate_speed(x_est, params["dt"])
+        params["beta_noise_std_deg"] = base_params["beta_noise_std_deg"]
+        params["gamma_noise_std_deg"] = base_params["gamma_noise_std_deg"]
 
-        # Average estimated speed over the whole run
-        v_est_avg = (x_est[-1] - x_est[0]) / (t[-1] - t[0])
-        err = abs(v_est_avg - params["car_speed"])
-        errors.append(err)
+        np.random.seed(0)
+        (
+            t,
+            drone_pos,
+            car_pos_true,
+            rel_true,
+            rel_meas,
+            v_true,
+            drone_speed,
+            drone_heading_deg,
+        ) = simulate_scene_with_sensor(params)
 
-        print(
-            f"[Noise sweep] range_noise_std={rn:.2f} m -> "
-            f"avg speed est error={err:.3f} m/s"
-        )
+        pos_true_xy = car_pos_true[:, :2]
+        v_true_win = estimate_speed_windowed_from_positions(pos_true_xy, sr, window_sec)
 
-    return range_noise_levels, errors
+        pos_est_xy = (drone_pos + rel_meas)[:, :2]
+        v_est_win = estimate_speed_windowed_from_positions(pos_est_xy, sr, window_sec)
 
+        mask = ~np.isnan(v_est_win) & ~np.isnan(v_true_win)
+        if np.any(mask):
+            rmse = np.sqrt(np.mean((v_est_win[mask] - v_true_win[mask]) ** 2))
+            mean_true_speed = np.mean(v_true_win[mask])
+            if mean_true_speed > 0:
+                acc = max(0.0, (1.0 - rmse / mean_true_speed)) * 100.0
+            else:
+                acc = 0.0
+        else:
+            acc = 0.0
+
+        accuracies.append(acc)
+
+    return np.array(noise_levels_range, dtype=float), np.array(accuracies, dtype=float)
+
+
+# ---------- Main ----------
 
 def main():
-    # ----- Simulation parameters you can tweak -----
+    # Base parameters
     params = {
-        "H": 50.0,  # drone height above ground (m)
-        "car_speed": 15.0,  # true car speed (m/s)
-        "duration": 20.0,  # total simulation time (s)
-        "dt": 0.1,  # time step (s)
+        "H": 80.0,               # nominal drone height [m]
+        "H_min": 50.0,           # min drone height [m]
+        "H_max": 130.0,          # max drone height [m]
 
-        # Sensor noise levels
-        "range_noise_std": 0.5,       # m (std dev of range noise)
-        "angle_noise_std_deg": 0.5,   # deg (std dev of elevation angle noise)
-        "pitch_noise_std_deg": 0.2,   # deg (std dev of pitch angle noise)
+        "car_speed": 26.8,       # nominal car speed [m/s] (~60 mph)
+        "sample_rate_hz": 10.0,  # 10 Hz rangefinder
+        "duration": 5.0,         # total time [s] (shortened to 5s)
 
-        # Drone pitch motion (attitude variation)
-        "pitch_amplitude_deg": 5.0,   # deg
-        "pitch_frequency_hz": 0.1,    # Hz
+        # lateral motion to simulate turns
+        "lateral_amp": 15.0,     # m
+        "lateral_freq_hz": 0.05, # Hz
+
+        # max allowed car speed change per second [mph/s]
+        "max_speed_change_mph_per_s": 5.0,
+
+        # sensor noise (base)
+        "range_noise_std": 0.5,      # m
+        "beta_noise_std_deg": 0.5,   # deg
+        "gamma_noise_std_deg": 1.0,  # deg
+
+        # drone following behavior
+        "drone_max_speed": 35.0,     # m/s (max ground speed)
+        "drone_kp_follow": 0.5,      # 1/s (how aggressively drone closes distance)
+        "drone_alt_step_std": 1.0,   # m per sample (vertical jitter)
     }
 
-    # For reproducibility
+    # 1 second window at 10 Hz → 10 samples
+    speed_window_sec = 2.0
+
     np.random.seed(0)
 
-    # ----- Run one simulation with the above parameters -----
-    t, x_true, sensor = simulate_scene(params)
-    x_est = estimate_positions(sensor, params)
-    v_true = np.full_like(x_true, params["car_speed"])
-    v_est = estimate_speed(x_est, params["dt"])
+    # --- Simulate one scenario ---
+    (
+        t,
+        drone_pos,
+        car_pos_true,
+        rel_true,
+        rel_meas,
+        v_true,
+        drone_speed,
+        drone_heading_deg,
+    ) = simulate_scene_with_sensor(params)
 
-    # Average speed estimate over entire run
-    v_est_avg = (x_est[-1] - x_est[0]) / (t[-1] - t[0])
-    v_true_val = params["car_speed"]
-    abs_err = abs(v_est_avg - v_true_val)
-    pct_err = 100.0 * abs_err / v_true_val
+    sr = params["sample_rate_hz"]
+    T = 1.0 / sr
 
-    print("==== Single-run summary ====")
-    print(f"True car speed:       {v_true_val:.3f} m/s")
-    print(f"Estimated car speed:  {v_est_avg:.3f} m/s")
-    print(f"Absolute error:       {abs_err:.3f} m/s")
-    print(f"Percentage error:     {pct_err:.2f} %")
+    # Ground truth ground positions
+    pos_true_xy = car_pos_true[:, :2]
 
-    # ----- Plot results for this run -----
-    pos_error = x_est - x_true
-    speed_error = v_est - v_true
+    # Estimated positions from noisy sensor: drone_pos + rel_meas
+    pos_est_xy = (drone_pos + rel_meas)[:, :2]
+    v_est_inst = estimate_speed_instantaneous_from_positions(pos_est_xy, sr)
+    v_est_win = estimate_speed_windowed_from_positions(pos_est_xy, sr, speed_window_sec)
 
-    fig, axes = plt.subplots(3, 1, figsize=(10, 10), sharex=True)
+    # Convert to mph
+    v_true_mph = v_true * MPS_TO_MPH
+    v_est_inst_mph = v_est_inst * MPS_TO_MPH
+    v_est_win_mph = v_est_win * MPS_TO_MPH
+    drone_speed_mph = drone_speed * MPS_TO_MPH
 
-    # 1) Position vs time
-    axes[0].plot(t, x_true, label="True position (x)", linewidth=2)
-    axes[0].plot(t, x_est, "--", label="Estimated position (x)", linewidth=2)
-    axes[0].set_ylabel("Position (m)")
-    axes[0].set_title("Car position: true vs estimated")
-    axes[0].legend()
+    # For metrics, compare windowed estimate vs true (windowed from true positions)
+    v_true_win = estimate_speed_windowed_from_positions(pos_true_xy, sr, speed_window_sec)
+    v_true_win_mph = v_true_win * MPS_TO_MPH
+
+    mask = ~np.isnan(v_true_win) & ~np.isnan(v_est_win)
+    mean_true_speed_mps = np.mean(v_true_win[mask])
+    mean_est_speed_mps = np.mean(v_est_win[mask])
+    mean_true_speed_mph = mean_true_speed_mps * MPS_TO_MPH
+    mean_est_speed_mph = mean_est_speed_mps * MPS_TO_MPH
+
+    abs_err_mps = abs(mean_est_speed_mps - mean_true_speed_mps)
+    abs_err_mph = abs_err_mps * MPS_TO_MPH
+    pct_err = 100.0 * abs_err_mps / mean_true_speed_mps if mean_true_speed_mps > 0 else 0.0
+
+    rmse_mps = np.sqrt(np.mean((v_est_win[mask] - v_true_win[mask]) ** 2))
+    rmse_mph = rmse_mps * MPS_TO_MPH
+
+    print("==== 3D speed estimation with moving drone, 5s sim, 1s window ====")
+    print(f"Sampling rate:            {sr} Hz  (T = {T:.3f} s)")
+    print(f"Window length:            {speed_window_sec:.2f} s")
+    print(f"Drone height bounds:      [{params['H_min']}, {params['H_max']}] m")
+    print(f"Max car speed change:     {params['max_speed_change_mph_per_s']} mph/s")
+    print(f"Mean true speed:          {mean_true_speed_mph:.3f} mph")
+    print(f"Mean estimated speed:     {mean_est_speed_mph:.3f} mph")
+    print(f"Abs error (mean):         {abs_err_mph:.3f} mph")
+    print(f"Percent error:            {pct_err:.2f} %")
+    print(f"RMSE over time (windowed):{rmse_mph:.3f} mph")
+    print(f"Mean drone speed:         {np.mean(drone_speed_mph):.3f} mph")
+    print(f"Drone heading range:      {np.min(drone_heading_deg):.1f}° to {np.max(drone_heading_deg):.1f}°")
+
+    # --- Robustness vs range noise ---
+    noise_levels_range = [0.0, 0.1, 0.3, 0.5, 1.0, 2.0]
+    noise_levels_range, accuracies = evaluate_noise_robustness(
+        params, noise_levels_range, speed_window_sec
+    )
+
+    # ---------- Plots (SAME STRUCTURE: 3 subplots) ----------
+    fig, axes = plt.subplots(3, 1, figsize=(10, 12))
+
+    # 1) Ground path: car, estimated car, and drone
+    axes[0].plot(pos_true_xy[:, 0], pos_true_xy[:, 1], label="Car true path", linewidth=2)
+    axes[0].plot(pos_est_xy[:, 0], pos_est_xy[:, 1], "--", label="Car est path (sensor)", linewidth=1)
+    axes[0].plot(drone_pos[:, 0], drone_pos[:, 1], ":", label="Drone path", linewidth=1)
+    axes[0].set_xlabel("x (m)")
+    axes[0].set_ylabel("y (m)")
+    axes[0].set_ylim(0,20)
+    axes[0].set_title("Car and drone ground paths")
+    axes[0].axis("equal")
     axes[0].grid(True)
+    axes[0].legend()
 
-    # 2) Speed vs time
-    axes[1].plot(t, v_true, label="True speed", linewidth=2)
-    axes[1].plot(t, v_est, "--", label="Estimated speed", linewidth=2)
-    axes[1].set_ylabel("Speed (m/s)")
-    axes[1].set_title("Car speed: true vs estimated")
-    axes[1].legend()
+    # 2) Speed vs time (mph): true car, estimated, and optionally drone
+    axes[1].plot(t, v_true_mph, label="Car true speed (instant)", linewidth=2)
+    axes[1].plot(t, v_est_inst_mph, "--", label="Car est inst speed", linewidth=1, alpha=0.5)
+    axes[1].plot(t, v_est_win_mph, "-", label=f"Car est windowed ({speed_window_sec:.1f}s)", linewidth=2)
+    axes[1].plot(t, drone_speed_mph, "-", label="Drone ground speed", linewidth=1)
+    axes[1].set_xlabel("Time (s)")
+    axes[1].set_ylabel("Speed (mph)")
+    axes[1].set_title("True vs estimated car speed and drone speed")
     axes[1].grid(True)
+    axes[1].legend()
+    max_speed_mph = np.nanmax(
+        [np.nanmax(v_true_mph), np.nanmax(v_est_inst_mph), np.nanmax(v_est_win_mph), np.nanmax(drone_speed_mph)]
+    )
+    axes[1].set_ylim(0, 1.2 * max_speed_mph)
 
-    # 3) Errors vs time
-    axes[2].plot(t, pos_error, label="Position error (x_est - x_true)")
-    axes[2].plot(t, speed_error, label="Speed error (v_est - v_true)")
-    axes[2].set_xlabel("Time (s)")
-    axes[2].set_ylabel("Error")
-    axes[2].set_title("Estimation errors vs time")
-    axes[2].legend()
+    # 3) Accuracy vs range noise
+    axes[2].plot(noise_levels_range, accuracies, "o-", linewidth=2)
+    axes[2].set_xlabel("Range noise stddev (m)")
+    axes[2].set_ylabel("Accuracy (%)")
+    axes[2].set_title("Windowed speed estimation accuracy vs range noise")
     axes[2].grid(True)
 
-    plt.tight_layout()
-    plt.show()
-
-    # ----- Extra: noise sweep (optional) -----
-    # Comment this block out if you don't care about noise sensitivity.
-    range_noise_levels = [0.1, 0.3, 0.5, 1.0, 2.0]  # meters
-    noise_levels, errors = run_noise_sweep(params, range_noise_levels)
-
-    plt.figure(figsize=(6, 4))
-    plt.plot(noise_levels, errors, "o-", linewidth=2)
-    plt.xlabel("Range noise std (m)")
-    plt.ylabel("Avg speed error (m/s)")
-    plt.title("Effect of range noise on speed estimation error")
-    plt.grid(True)
     plt.tight_layout()
     plt.show()
 
