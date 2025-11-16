@@ -5,16 +5,16 @@
 # "airsim-truth": AirSim for drone + car truth, synthetic sensor
 # "airsim-vision": AirSim for drone + camera, OpenCV for car measurement
 # "camera-vision": Real camera + MAVLink drone, OpenCV for car measurement
-MODE = "sitl"
+MODE = "airsim-vision"
 
 # For non-AirSim camera (e.g. USB cam)
 VIDEO_SOURCE = 0     # cv2.VideoCapture index or RTSP URL
 
 # --- MAVLink / QGC ----------------------------------------------------
-MAVLINK_CONNECTION = "udp:127.0.0.1:14550"
-QGC_IP  = "192.168.1.220"
-QGC_PORT = 14550
-CAR_SYSID = 42
+# MAVLINK_CONNECTION = "udp:127.0.0.1:14550"
+# QGC_IP  = "192.168.1.220"
+# QGC_PORT = 14550
+# CAR_SYSID = 42
 
 # --- Road / car config ------------------------------------------------
 ROAD_HEADING_DEG = 0.0
