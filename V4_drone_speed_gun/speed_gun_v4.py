@@ -2,18 +2,14 @@
 import time
 import math
 import numpy as np
-from pymavlink import mavutil
 
 from .config import *
 from .mavlink_client import MavlinkClient
 from .airsim_client import AirsimClient
-from .sim_car import CarSim
 from .estimators import PositionSpeedEstimator
-from .geometry import (
-    sensor_from_truth, apply_sensor_noise, rel_vec_from_sensor,
-    local_to_gps,
-)
+from .geometry import rel_vec_from_sensor
 from .vision_model import VisionMeasurementSource
+from .utils import format_speed_line
 
 import cv2  # for vision modes
 
@@ -25,14 +21,6 @@ def build_drone_source():
         return MavlinkClient(MAVLINK_CONNECTION)
 
 
-def build_car_source(road_origin_vec):
-    # For now, always CarSim (even in AirSim modes you can swap to GT later)
-    return CarSim(
-        road_origin_vec=road_origin_vec,
-        road_heading_deg=ROAD_HEADING_DEG,
-        speed_mps=CAR_SPEED_MPS,
-    )
-
 
 def build_vision_source():
     if "vision" in MODE:
@@ -41,23 +29,22 @@ def build_vision_source():
 
 
 def main():
+    """
+    Main loop: acquire drone pose and vision measurements, estimate car speed.
+    
+    - Drone pose comes from AirsimClient or MavlinkClient depending on MODE.
+    - Car position is estimated ONLY from vision detection (rel_est).
+    - Speed is estimated along the road heading using only estimated car position.
+    - No Python-side car simulation; no synthetic sensor noise applied to measurements.
+    """
     drone = build_drone_source()
 
-    # Origin only exists in MAVLink/SITL world; AirSim doesn't need it.
-    origin_lat, origin_lon = 0.0, 0.0
+    # Note: origin_lat/lon is only used for potential coordinate transforms;
+    # we use local NED coordinates throughout this script.
     if isinstance(drone, MavlinkClient):
         origin_lat, origin_lon = drone.get_origin_latlon()
         print(f"[SIM] Using origin lat/lon {origin_lat:.7f}, {origin_lon:.7f}")
 
-    car_link = mavutil.mavlink_connection(
-        f"udpout:{QGC_IP}:{QGC_PORT}",
-        source_system=CAR_SYSID,
-        source_component=1,
-    )
-    print(f"[CAR] Sending car MAVLink to {QGC_IP}:{QGC_PORT} as sysid {CAR_SYSID}")
-
-    road_origin_vec = np.array([100.0, 0.0, 0.0], dtype=float)
-    car = build_car_source(road_origin_vec)
     speed_estimator = PositionSpeedEstimator(
         road_heading_deg=ROAD_HEADING_DEG,
         window_size=WINDOW_SIZE,
@@ -75,8 +62,6 @@ def main():
     prev_drone_pos = None
     prev_drone_t = None
     t_start = time.time()
-    last_car_hb = 0.0
-    car_heading_cdeg = int((ROAD_HEADING_DEG % 360.0) * 100)
 
     try:
         while True:
@@ -90,11 +75,7 @@ def main():
                 continue
             drone_alt = float(drone_pos[2])
 
-            # --- Car state (truth) ---
-            car_state = car.get_state()
-            t_car = car_state["t"]
-            car_pos_true = car_state["pos_vec"]
-            t_now = t_car
+            t_now = time.time()
 
             # --- Drone velocity / heading (for debug print only) ---
             drone_heading_deg = None
@@ -110,81 +91,49 @@ def main():
             prev_drone_pos = drone_pos.copy()
             prev_drone_t = t_now
 
-            # --- Measurement path ---
+            # --- Vision measurement path (if enabled) ---
             if "vision" in MODE:
                 if isinstance(drone, AirsimClient):
                     frame = drone.get_rgb_frame()
                 else:
+                    # Real camera mode
                     ret, frame = cap.read()
                     if not ret:
                         print("[VISION] No frame, stopping.")
                         break
 
+                # Get (R, beta, gamma) measurement from vision
                 meas = vision.estimate_measurement(frame, drone_alt)
                 if meas is None:
-                    # Just skip this loop, estimator will lag a bit
+                    # No valid detection this iteration; skip to next
                     continue
                 R_meas, beta_meas, gamma_meas = meas
-
             else:
-                # synthetic sensor from truth
-                R_true, beta_true, gamma_true = sensor_from_truth(drone_pos, car_pos_true)
-                R_meas, beta_meas, gamma_meas = apply_sensor_noise(
-                    R_true, beta_true, gamma_true
-                )
+                # Non-vision modes are no longer supported (car only exists in Unreal)
+                print("[ERROR] Non-vision modes are not supported. Car exists only in AirSim.")
+                break
 
+            # Convert measurement to relative position vector in local frame
             rel_est = rel_vec_from_sensor(R_meas, beta_meas, gamma_meas)
             car_pos_est = drone_pos + rel_est
 
-            delta_true = car_pos_true - drone_pos
-            range_true_m = float(np.linalg.norm(delta_true))
-
-            # --- Speed estimation (est vs truth selector) ---
-            if USE_SENSOR_BASED_ESTIMATE:
-                v_road_mps = speed_estimator.update(t_car, car_pos_est)
-            else:
-                v_road_mps = speed_estimator.update(t_car, car_pos_true)
+            # --- Speed estimation using measured car position ---
+            v_road_mps = speed_estimator.update(t_now, car_pos_est)
 
             if v_road_mps is not None:
                 est_mph = v_road_mps * 2.23694
-                true_mph = CAR_SPEED_MPS * 2.23694
-                err_mph  = est_mph - true_mph
-                over     = est_mph > (SPEED_LIMIT_MPH + OVER_LIMIT_MARGIN_MPH)
+                over = est_mph > (SPEED_LIMIT_MPH + OVER_LIMIT_MARGIN_MPH)
 
-                heading_str = "n/a" if drone_heading_deg is None else f"{drone_heading_deg:5.1f}°"
-                print(
-                    f"[SpeedGun] Drone (alt {drone_alt:5.1f} m, heading {heading_str},"
-                    f" {drone_speed_mps:4.1f} m/s)   "
-                    f"Range ~{R_meas:6.1f} m (true {range_true_m:6.1f} m)   "
-                    f"Car est {est_mph:5.1f} mph   true {true_mph:5.1f} mph   "
-                    f"err {err_mph:5.1f} mph   OVER={over}"
+                # Format and print status line
+                status_line = format_speed_line(
+                    drone_alt=drone_alt,
+                    drone_heading_deg=drone_heading_deg,
+                    drone_speed_mps=drone_speed_mps,
+                    R_meas=R_meas,
+                    est_mph=est_mph,
+                    over=over,
                 )
-
-            # --- QGC visualization (always truth for now) ---
-            if isinstance(drone, MavlinkClient):
-                car_lat, car_lon = local_to_gps(car_pos_true, origin_lat, origin_lon)
-                if t_now - last_car_hb > 1.0:
-                    car_link.mav.heartbeat_send(
-                        mavutil.mavlink.MAV_TYPE_GROUND_ROVER,
-                        mavutil.mavlink.MAV_AUTOPILOT_GENERIC,
-                        0, 0,
-                        mavutil.mavlink.MAV_STATE_ACTIVE,
-                    )
-                    last_car_hb = t_now
-
-                car_link.mav.global_position_int_send(
-                    int((t_now - t_start) * 1000),
-                    int(car_lat * 1e7),
-                    int(car_lon * 1e7),
-                    0, 0, 0, 0, 0,
-                    car_heading_cdeg,
-                )
-                car_link.mav.vfr_hud_send(
-                    float(CAR_SPEED_MPS),
-                    float(CAR_SPEED_MPS),
-                    int(ROAD_HEADING_DEG),
-                    0, 0.0, 0.0,
-                )
+                print(status_line)
 
             elapsed = time.time() - t_loop_start
             sleep_time = dt_target - elapsed

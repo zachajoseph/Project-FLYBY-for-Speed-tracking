@@ -41,10 +41,7 @@ def format_speed_line(
     drone_heading_deg,
     drone_speed_mps: float,
     R_meas: float,
-    range_true_m: float,
     est_mph: float,
-    true_mph: float,
-    err_mph: float,
     over: bool,
 ) -> str:
     """
@@ -58,9 +55,7 @@ def format_speed_line(
     return (
         f"[SpeedGun] "
         f"Drone (alt {drone_alt:5.1f} m, heading {heading_str}, {drone_speed_mps:4.1f} m/s)   "
-        f"Range ~{R_meas:6.1f} m (true {range_true_m:6.1f} m)   "
+        f"Range ~{R_meas:6.1f} m   "
         f"Car est {est_mph:5.1f} mph   "
-        f"true {true_mph:5.1f} mph   "
-        f"err {err_mph:5.1f} mph   "
         f"OVER={over}"
     )

@@ -1,4 +1,5 @@
 # V4_drone_speed_gun/vision_model.py
+import os
 import math
 import cv2
 import numpy as np
@@ -7,14 +8,14 @@ COCO_CAR_LIKE_IDS = {2, 3, 5, 7}  # COCO: car, motorcycle, bus, truck
 
 class VisionMeasurementSource:
     """
-    Uses SSD-Mobilenet v3 (COCO) via OpenCV to detect vehicles and
-    convert the best bounding box into (R, beta, gamma).
+    Detects vehicles using one of two OpenCV DNN backends (model1 or model2)
+    and converts the best bounding box into (R, beta, gamma).
+    
+    Backend selected via VISION_BACKEND environment variable (default: "model1").
     """
 
     def __init__(
         self,
-        model_path="V4_drone_speed_gun/models/ssd_mobilenet_v3_large_coco_2020_01_14.pb",
-        config_path="V4_drone_speed_gun/models/ssd_mobilenet_v3_large_coco_2020_01_14.pbtxt",
         camera_fov_deg=60.0,
         conf_thresh=0.5,
         nms_thresh=0.3,
@@ -23,12 +24,48 @@ class VisionMeasurementSource:
         self.conf_thresh = conf_thresh
         self.nms_thresh = nms_thresh
 
-        net = cv2.dnn_DetectionModel(model_path, config_path)
-        net.setInputSize(320, 320)
-        net.setInputScale(1.0 / 127.5)
-        net.setInputMean((127.5, 127.5, 127.5))
-        net.setInputSwapRB(True)
-        self.net = net
+        # Select backend from environment variable
+        self.backend = os.environ.get("VISION_BACKEND", "model1").lower()
+        print(f"[VISION] Using backend: {self.backend}")
+        
+        self.net = self._load_model(self.backend)
+
+    def _load_model(self, backend: str):
+        """Load the selected detection model backend."""
+        if backend == "model1":
+            # SSD-Mobilenet v3 (COCO)
+            model_path = "V4_drone_speed_gun/models/ssd_mobilenet_v3_large_coco_2020_01_14.pb"
+            config_path = "V4_drone_speed_gun/models/ssd_mobilenet_v3_large_coco_2020_01_14.pbtxt"
+            net = cv2.dnn_DetectionModel(model_path, config_path)
+            net.setInputSize(320, 320)
+            net.setInputScale(1.0 / 127.5)
+            net.setInputMean((127.5, 127.5, 127.5))
+            net.setInputSwapRB(True)
+        elif backend == "model2":
+            # Alternative model backend (placeholder; update with actual model paths/config)
+            model_path = "V4_drone_speed_gun/models/model2.pb"
+            config_path = "V4_drone_speed_gun/models/model2.pbtxt"
+            net = cv2.dnn_DetectionModel(model_path, config_path)
+            net.setInputSize(320, 320)
+            net.setInputScale(1.0 / 127.5)
+            net.setInputMean((127.5, 127.5, 127.5))
+            net.setInputSwapRB(True)
+        else:
+            raise ValueError(f"Unknown VISION_BACKEND: {backend}")
+        
+        return net
+
+    def _detect(self, frame):
+        """
+        Run detection model on frame and return (classes, confidences, boxes).
+        Unified interface for both backends.
+        """
+        classes, confidences, boxes = self.net.detect(
+            frame,
+            confThreshold=self.conf_thresh,
+            nmsThreshold=self.nms_thresh,
+        )
+        return classes, confidences, boxes
 
     def estimate_measurement(self, frame, drone_alt_m):
         """
@@ -40,11 +77,7 @@ class VisionMeasurementSource:
         """
         h, w, _ = frame.shape
 
-        classes, confidences, boxes = self.net.detect(
-            frame,
-            confThreshold=self.conf_thresh,
-            nmsThreshold=self.nms_thresh,
-        )
+        classes, confidences, boxes = self._detect(frame)
 
         if classes is None or len(classes) == 0:
             return None
