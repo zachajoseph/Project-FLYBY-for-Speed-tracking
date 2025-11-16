@@ -2,6 +2,8 @@
 import time
 import math
 from pathlib import Path
+import numpy as np
+
 
 import cv2
 from flask import Flask, Response
@@ -169,16 +171,18 @@ def generate_frames():
         class_ids, confidences, boxes = net.detect(frame, CONF_THRESH, NMS_THRESH)
 
         detections = []
-        if class_ids is not None:
-            for class_id, conf, box in zip(class_ids.flatten(),
-                                           confidences.flatten(),
-                                           boxes):
+        if class_ids is not None and len(class_ids) > 0:
+            class_ids = np.array(class_ids).flatten()
+            confidences = np.array(confidences).flatten()
+
+            for class_id, conf, box in zip(class_ids, confidences, boxes):
                 if class_id not in VEHICLE_CLASS_IDS:
                     continue
                 x, y, bw, bh = box
                 cx = x + bw / 2.0
                 cy = y + bh / 2.0
                 detections.append((box, cx, cy))
+
 
         # match detections to tracks and estimate speed
         boxes_with_speed = match_tracks(detections, w)
