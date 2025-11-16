@@ -188,8 +188,22 @@ def generate_frames():
         boxes_with_speed = match_tracks(detections, w)
 
         # draw boxes directly, no tracking / speed
+        min_area = 0.001 * w * h      # ignore tiny boxes
+        max_area = 0.4 * w * h        # ignore “whole screen” boxes
+        min_aspect = 0.4              # h/w
+        max_aspect = 3.0
+
         for box, cx, cy in detections:
             x, y, bw, bh = box
+            area = bw * bh
+            aspect = bh / max(bw, 1)
+
+            if area < min_area or area > max_area:
+                continue
+            if aspect < min_aspect or aspect > max_aspect:
+                continue
+            # draw box
+
 
             # optional: ignore huge boxes that cover most of the frame
             area = bw * bh
