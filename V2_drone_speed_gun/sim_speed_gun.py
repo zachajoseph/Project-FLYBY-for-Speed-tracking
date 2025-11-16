@@ -158,33 +158,85 @@ class CarSim:
 
 class PositionSpeedEstimator:
     """
-    Uses a vector of car positions over time to estimate speed along the road.
-    - Projects car position onto road direction.
-    - Uses finite difference on the last two samples.
+    Estimates ground speed directly from successive 3D positions.
+    - Stores (t, pos_vec) samples over a history window.
+    - Computes horizontal speed (x, y only) from last two samples.
+    - Works correctly for curved paths.
     """
-    def __init__(self, road_heading_deg, window_size=15):
-        self.dir_vec = unit_vector_from_heading_deg(road_heading_deg)
-        self.samples = deque(maxlen=window_size)  # (t, s_along_road_m)
+    def __init__(self, window_size=15):
+        self.samples = deque(maxlen=window_size)  # (t, pos_vec)
 
     def update(self, t, car_pos_vec):
         """
         Add a new (t, car_pos_vec) sample and return estimated
-        road speed in m/s, or None if not enough samples yet.
+        ground speed in m/s, or None if not enough samples yet.
+        
+        Speed is computed from horizontal distance (x, y only):
+        - dpos = p2 - p1 (last two positions)
+        - vx = dpos[0] / dt, vy = dpos[1] / dt
+        - speed_mps = sqrt(vx*vx + vy*vy)
         """
-        # Project car position onto road direction (scalar)
-        s = float(np.dot(car_pos_vec, self.dir_vec))
-        self.samples.append((t, s))
+        self.samples.append((t, car_pos_vec.copy()))
 
         if len(self.samples) < 2:
             return None
 
-        (t1, s1), (t2, s2) = self.samples[-2], self.samples[-1]
+        (t1, pos1), (t2, pos2) = self.samples[-2], self.samples[-1]
         dt = t2 - t1
         if dt <= 0:
             return None
 
-        v_road_mps = (s2 - s1) / dt
-        return v_road_mps
+        dpos = pos2 - pos1
+        vx = dpos[0] / dt
+        vy = dpos[1] / dt
+        speed_mps = math.sqrt(vx * vx + vy * vy)
+        return speed_mps
+
+
+# =========================
+# HEADING ESTIMATOR (SMOOTHED)
+# =========================
+
+class HeadingEstimator:
+    """
+    Smooths heading estimates over a history window.
+    - Handles circular mean for heading angles to avoid wrap-around issues.
+    - Uses circular buffer of heading samples.
+    """
+    def __init__(self, window_size=10):
+        self.samples = deque(maxlen=window_size)  # heading in degrees
+
+    def _circular_mean(self, headings_deg):
+        """
+        Compute circular mean of heading angles (0-360°).
+        Avoids issues at the 0/360 boundary.
+        """
+        if not headings_deg:
+            return None
+        
+        # Convert to radians and compute sin/cos mean
+        sin_sum = sum(math.sin(math.radians(h)) for h in headings_deg)
+        cos_sum = sum(math.cos(math.radians(h)) for h in headings_deg)
+        
+        mean_rad = math.atan2(sin_sum, cos_sum)
+        mean_deg = (math.degrees(mean_rad) + 360.0) % 360.0
+        return mean_deg
+
+    def update(self, raw_heading_deg):
+        """
+        Add a new raw heading sample and return the smoothed heading.
+        Returns None if not enough samples yet.
+        """
+        if raw_heading_deg is None:
+            return None
+
+        self.samples.append(raw_heading_deg)
+
+        if len(self.samples) < 2:
+            return raw_heading_deg
+
+        smoothed = self._circular_mean(list(self.samples))
+        return smoothed
 
 
 # =========================
@@ -217,10 +269,9 @@ def main():
         speed_mps=CAR_SPEED_MPS
     )
 
-    speed_estimator = PositionSpeedEstimator(
-        road_heading_deg=ROAD_HEADING_DEG,
-        window_size=WINDOW_SIZE
-    )
+    speed_estimator = PositionSpeedEstimator(window_size=WINDOW_SIZE)
+
+    heading_estimator = HeadingEstimator(window_size=10)
 
     print("[SIM] Starting loop. Press Ctrl+C to quit.")
     dt_target = 1.0 / LOOP_HZ
@@ -264,7 +315,9 @@ def main():
                     vx, vy = dpos[0] / dt, dpos[1] / dt   # x=north, y=east
                     drone_speed_mps = math.sqrt(vx * vx + vy * vy)
                     heading_rad = math.atan2(vy, vx)      # atan2(east, north)
-                    drone_heading_deg = (math.degrees(heading_rad) + 360.0) % 360.0
+                    raw_heading_deg = (math.degrees(heading_rad) + 360.0) % 360.0
+                    # Apply smoothing filter to heading
+                    drone_heading_deg = heading_estimator.update(raw_heading_deg)
 
             prev_drone_pos = drone_pos.copy()
             prev_drone_t = t_now
@@ -288,11 +341,13 @@ def main():
 
                 print(
                     f"[SpeedGun] "
+                    f"range={range_m:6.1f} m"
                     f"Drone (heading {heading_str}, {drone_speed_mps:4.1f} m/s)   "
                     f"Car: est {est_mph:5.1f} mph   "
                     f"true {true_mph:5.1f} mph   "
                     f"err {err_mph:5.1f} mph   "
                     f"OVER={over}"
+
                 )
 
             # 5) Send car as a fake MAVLink ground vehicle to QGC
