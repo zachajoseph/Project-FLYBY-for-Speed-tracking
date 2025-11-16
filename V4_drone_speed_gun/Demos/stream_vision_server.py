@@ -23,15 +23,23 @@ if not cap.isOpened():
 
 vision = VisionMeasurementSource()
 
+frame_idx = 0
+
 def generate_frames():
+    global frame_idx
     if cap is None:
         return
 
     while True:
         ret, frame = cap.read()
+        frame_idx += 1
         if not ret:
             print("[STREAM] Camera error or end of stream.")
             break
+
+        if frame_idx % 30 == 0:
+            print(f"[STREAM] frame {frame_idx}, shape={frame.shape}, mean={frame.mean():.2f}")
+
 
         # Run detection / measurement
         meas = vision.estimate_measurement(frame, DRONE_ALT_M)
