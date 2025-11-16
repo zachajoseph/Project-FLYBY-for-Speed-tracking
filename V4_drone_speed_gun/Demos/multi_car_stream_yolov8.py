@@ -15,7 +15,8 @@ NMS_THRESH = 0.45           # IoU threshold
 # 0 person, 1 bicycle, 2 car, 3 motorcycle, 5 bus, 7 truck
 VEHICLE_CLASS_IDS = {2, 3, 5, 7}
 
-RUN_EVERY_N_FRAMES = 2      # minimal smoothing: run YOLO on every 2nd frame
+RUN_EVERY_N_FRAMES = 3      # run YOLO on every 3rd frame
+SMOOTH_ALPHA = 0.7          # 0.7 = 70% previous, 30% new (strong smoothing)
 
 app = Flask(__name__)
 
@@ -106,7 +107,7 @@ def generate_frames():
             min_aspect = 0.3
             max_aspect = 3.5
 
-            new_boxes = []
+            raw_boxes = []
             for box in results.boxes:
                 cls = int(box.cls[0])
                 conf = float(box.conf[0])
@@ -125,17 +126,31 @@ def generate_frames():
                 if not (min_aspect <= aspect <= max_aspect):
                     continue
 
-                new_boxes.append((x1, y1, x2, y2, cls, conf))
+                raw_boxes.append((x1, y1, x2, y2, cls, conf))
 
-            # cache detections for use on skipped frames
-            last_boxes = new_boxes
+            # --- simple smoothing vs previous frame's boxes ---
+            smoothed = []
+            for i, (x1, y1, x2, y2, cls, conf) in enumerate(raw_boxes):
+                if i < len(last_boxes) and last_boxes[i][4] == cls:
+                    px1, py1, px2, py2, pcl, pconf = last_boxes[i]
+                    sx1 = int(SMOOTH_ALPHA * px1 + (1.0 - SMOOTH_ALPHA) * x1)
+                    sy1 = int(SMOOTH_ALPHA * py1 + (1.0 - SMOOTH_ALPHA) * y1)
+                    sx2 = int(SMOOTH_ALPHA * px2 + (1.0 - SMOOTH_ALPHA) * x2)
+                    sy2 = int(SMOOTH_ALPHA * py2 + (1.0 - SMOOTH_ALPHA) * y2)
+                    sconf = SMOOTH_ALPHA * pconf + (1.0 - SMOOTH_ALPHA) * conf
+                    smoothed.append((sx1, sy1, sx2, sy2, cls, sconf))
+                else:
+                    # no previous box to smooth with, just use raw
+                    smoothed.append((x1, y1, x2, y2, cls, conf))
+
+            last_boxes = smoothed
 
         # draw last_boxes on current frame (even if YOLO skipped this frame)
         for x1, y1, x2, y2, cls, conf in last_boxes:
             color = (0, 255, 0)
             cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
 
-            # simple center-of-mass marker for the box
+            # simple center marker
             cx = (x1 + x2) // 2
             cy = (y1 + y2) // 2
             cv2.circle(frame, (cx, cy), 3, (0, 0, 255), -1)
