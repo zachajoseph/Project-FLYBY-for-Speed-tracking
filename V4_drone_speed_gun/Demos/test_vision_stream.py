@@ -1,4 +1,9 @@
 #!/usr/bin/env python3
+import os
+import sys
+# Ensure project root is on sys.path so imports like `V4_drone_speed_gun` work
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..')))
+
 import cv2
 import time
 import numpy as np
@@ -8,7 +13,7 @@ from V4_drone_speed_gun.vision_model import VisionMeasurementSource
 # Pick a fake altitude for testing geometry
 DRONE_ALT_M = 30.0  # pretend drone is 30 m above ground
 
-def main(source=0):
+def main(source=1):
     # source can be 0 (webcam) or a video path string
     cap = cv2.VideoCapture(source)
     if not cap.isOpened():

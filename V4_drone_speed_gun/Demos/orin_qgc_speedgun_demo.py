@@ -1,4 +1,9 @@
 #!/usr/bin/env python3
+import os
+import sys
+# Ensure project root is on sys.path so imports like `V4_drone_speed_gun` work
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..')))
+
 import time
 import math
 
