@@ -1,62 +1,68 @@
 #!/usr/bin/env python3
 """
-sim_speed_gunv3.py
+speed_gun.py
 
-Simulate a ground vehicle (car) moving along a straight road in the local NED frame.
-Use the drone as a "speed gun" sensor: derive synthetic range + angle measurements
-from the drone to the car, add noise, reconstruct car position, and estimate speed.
+Vision-based speed gun:
 
-Also spoof a GROUND_ROVER to QGroundControl using MAVLink so you can visualize
-the car on the map.
+- Drone pose comes from ArduPilot (MAVLink LOCAL_POSITION_NED) or AirSim.
+- Camera frames come from:
+    * OpenCV video source (e.g. USB cam, RTSP), or
+    * AirSim RGB camera.
+- Vision model produces a bounding box and (R, beta, gamma) measurement
+  from the drone to the car.
+- We back-project to 3D and estimate the car's speed along a known road
+  direction using a ~2 second sliding window average.
 
-Assumptions:
-- Local frame: x = north, y = east, z = up.
-- MAVLink LOCAL_POSITION_NED: x = north, y = east, z = down (we flip z).
+Local frame convention:
+  x = north, y = east, z = up
+
+MAVLink LOCAL_POSITION_NED:
+  x = north, y = east, z = down  (we flip z)
 """
 
 import math
 import time
 from collections import deque
+from typing import Optional, Tuple
 
+import cv2
 import numpy as np
 from pymavlink import mavutil
 
+try:
+    import airsim
+except ImportError:
+    airsim = None
+
 # ---------------------------------------------------------------------------
-# Configuration
+# Configuration (formerly config.py, now embedded here)
 # ---------------------------------------------------------------------------
 
-# MAVLink connection to flight controller (SITL or real)
+# --- Backends / modes -------------------------------------------------
+# "airsim-vision":  AirSim drone + camera vision detection
+# "camera-vision":  Real camera + MAVLink drone, OpenCV detection
+MODE = "camera-vision"
+
+# For non-AirSim camera (e.g. USB cam or RTSP URL)
+VIDEO_SOURCE = 0  # cv2.VideoCapture index or RTSP URL
+
+# --- MAVLink (for drone pose only) -----------------------------------
 MAVLINK_CONNECTION = "udp:127.0.0.1:14550"
 
-# MAVLink connection to QGroundControl (spoofed car)
-QGC_CONNECTION = "udpout:127.0.0.1:14560"
-CAR_SYSID = 50          # system ID for spoofed ground vehicle
-CAR_COMPID = 1          # component ID for spoofed ground vehicle
-
-# Earth radius for local→GPS conversion (simple flat-earth approx)
-EARTH_RADIUS_M = 6_378_137.0
-
-# Car / road config
-CAR_SPEED_MPS = 20.0          # 20 m/s ≈ 44.7 mph
+# --- Road / speed config ---------------------------------------------
 ROAD_HEADING_DEG = 0.0        # 0° = north (+x), 90° = east (+y)
-ROAD_ORIGIN_VEC = np.array([100.0, 0.0, 0.0], dtype=float)  # start of road in local frame
-
-# Speed limit logic
 SPEED_LIMIT_MPH = 35.0
-SPEED_LIMIT_MARGIN_MPH = 5.0   # over-limit if est >= limit + margin
+OVER_LIMIT_MARGIN_MPH = 5.0   # mph over the limit before we flag
 
-# Sensor noise (synthetic LOS sensor)
-RANGE_NOISE_STD_M = 2.0        # meters
-BETA_NOISE_STD_DEG = 1.0       # elevation noise (deg)
-GAMMA_NOISE_STD_DEG = 1.0      # azimuth noise (deg)
-MIN_SENSOR_RANGE_M = 1.0       # ignore measurements below this
+# --- Estimator / loop timing -----------------------------------------
+LOOP_HZ = 10.0
+WINDOW_SIZE = 20              # samples kept; with LOOP_HZ=10 → ~2 s window
+WINDOW_SEC = WINDOW_SIZE / LOOP_HZ
 
-# Estimator behavior
-USE_SENSOR_BASED_ESTIMATE = True   # True: use reconstructed car position; False: use ground truth
-WINDOW_SIZE = 15                   # samples for regression window
-
-# Loop
-LOOP_RATE_HZ = 10.0                # target control loop rate (Hz)
+# --- Sensor model (kept for completeness; not heavily used here) -----
+RANGE_NOISE_STD_M = 0.5
+BETA_NOISE_STD_DEG = 0.5
+GAMMA_NOISE_STD_DEG = 1.0
 
 
 # ---------------------------------------------------------------------------
@@ -67,421 +73,420 @@ def mps_to_mph(v_mps: float) -> float:
     return v_mps * 2.2369362920544
 
 
-def clamp(x: float, xmin: float, xmax: float) -> float:
-    return max(xmin, min(xmax, x))
+class LoopTimer:
+    def __init__(self, hz: float):
+        self.period = 1.0 / hz
+        self.next_time = time.time()
+
+    def sleep_to_rate(self):
+        self.next_time += self.period
+        dt = self.next_time - time.time()
+        if dt > 0:
+            time.sleep(dt)
+        else:
+            # If we fell behind badly, reset the schedule
+            self.next_time = time.time()
 
 
 # ---------------------------------------------------------------------------
-# MAVLink client to FC (drone)
+# MAVLink client (embedded version of mavlink_client.py)
 # ---------------------------------------------------------------------------
 
 class MavlinkClient:
-    def __init__(self, conn_str: str):
-        self.conn = mavutil.mavlink_connection(conn_str)
-        print(f"[MAV] Connecting to FC at {conn_str} ...")
-        self.conn.wait_heartbeat()
-        print(f"[MAV] Heartbeat from system {self.conn.target_system}, component {self.conn.target_component}")
+    def __init__(self, connection_str: str):
+        print(f"[MAVLINK] Connecting to {connection_str} ...")
+        self.master = mavutil.mavlink_connection(connection_str)
+        self.master.wait_heartbeat()
+        print(
+            "[MAVLINK] Heartbeat received.",
+            "System:", self.master.target_system,
+            "Component:", self.master.target_component,
+        )
 
-        # Origin for local-to-GPS mapping
+        self.last_pos_vec = None
         self.origin_lat = None
         self.origin_lon = None
-        self.origin_alt = None
 
-        # Request data streams (just to be explicit; SITL often streams anyway)
-        self._request_data_streams()
-
-    def _request_data_streams(self):
-        try:
-            self.conn.mav.request_data_stream_send(
-                self.conn.target_system,
-                self.conn.target_component,
-                mavutil.mavlink.MAV_DATA_STREAM_POSITION,
-                10,  # 10 Hz
-                1,
-            )
-        except Exception:
-            # Not fatal; some FCs ignore this
-            pass
-
-    def get_origin_gps(self, timeout: float = 10.0):
-        """Block until we see a GLOBAL_POSITION_INT to define the origin."""
-        if self.origin_lat is not None:
-            return self.origin_lat, self.origin_lon, self.origin_alt
-
-        print("[MAV] Waiting for GLOBAL_POSITION_INT to set origin...")
-        start = time.time()
-        while True:
-            msg = self.conn.recv_match(type="GLOBAL_POSITION_INT", blocking=True, timeout=1.0)
-            if msg is not None:
-                self.origin_lat = msg.lat / 1e7
-                self.origin_lon = msg.lon / 1e7
-                self.origin_alt = msg.alt / 1000.0
-                print(f"[MAV] Origin set: lat={self.origin_lat:.7f}, lon={self.origin_lon:.7f}, alt={self.origin_alt:.1f} m")
-                return self.origin_lat, self.origin_lon, self.origin_alt
-
-            if time.time() - start > timeout:
-                raise RuntimeError("Timeout waiting for GLOBAL_POSITION_INT for origin")
-
-    def get_drone_state(self, timeout: float = 1.0):
+    def get_drone_position_vec(self) -> Optional[np.ndarray]:
         """
-        Returns:
-            pos_local: np.array([x, y, z]) in meters (x=north, y=east, z=up)
-            vel_local: np.array([vx, vy, vz]) in m/s (x=north, y=east, z=up)
+        Return drone position in local frame [x, y, z_up] (meters).
+
+        Uses LOCAL_POSITION_NED: x=north, y=east, z=down and flips z.
         """
-        msg = self.conn.recv_match(type="LOCAL_POSITION_NED", blocking=True, timeout=timeout)
+        msg = self.master.recv_match(
+            type="LOCAL_POSITION_NED",
+            blocking=True,
+            timeout=1.0
+        )
         if msg is None:
-            raise RuntimeError("Timeout waiting for LOCAL_POSITION_NED")
+            return self.last_pos_vec
 
-        # LOCAL_POSITION_NED: x,y,z in NED (z down), vx,vy,vz in NED (vz down)
-        x = float(msg.x)
-        y = float(msg.y)
-        z_up = -float(msg.z)
-        vx = float(msg.vx)
-        vy = float(msg.vy)
-        vz_up = -float(msg.vz)
-
-        pos = np.array([x, y, z_up], dtype=float)
-        vel = np.array([vx, vy, vz_up], dtype=float)
-        return pos, vel
-
-    def local_to_gps(self, local_vec: np.ndarray):
-        """
-        Convert local (x=north, y=east, z=up) to approximate lat, lon, alt.
-        Simple flat-earth approximation around origin.
-        """
-        if self.origin_lat is None:
-            self.get_origin_gps()
-
-        d_north = float(local_vec[0])
-        d_east = float(local_vec[1])
-        d_up = float(local_vec[2])
-
-        d_lat = (d_north / EARTH_RADIUS_M) * (180.0 / math.pi)
-        denom = EARTH_RADIUS_M * math.cos(math.radians(self.origin_lat))
-        if abs(denom) < 1e-6:
-            # Extremely unlikely in practice; avoid division by zero
-            d_lon = 0.0
-        else:
-            d_lon = (d_east / denom) * (180.0 / math.pi)
-
-        lat = self.origin_lat + d_lat
-        lon = self.origin_lon + d_lon
-        alt = self.origin_alt + d_up
-        return lat, lon, alt
+        self.last_pos_vec = np.array(
+            [float(msg.x), float(msg.y), -float(msg.z)],
+            dtype=float,
+        )
+        return self.last_pos_vec
 
 
 # ---------------------------------------------------------------------------
-# QGC spoofed car sender
+# AirSim client (optional; only used if MODE == "airsim-vision")
 # ---------------------------------------------------------------------------
 
-class QGCCarSender:
-    def __init__(self, conn_str: str, sysid: int = CAR_SYSID, compid: int = CAR_COMPID):
-        self.sysid = sysid
-        self.compid = compid
-        print(f"[QGC] Connecting spoofed car at {conn_str} (sysid={sysid}) ...")
-        self.mav = mavutil.mavlink_connection(conn_str, source_system=sysid, source_component=compid)
-
-        self.last_heartbeat_time = 0.0
-        self.last_gps_time = 0.0
-        self.last_vfr_time = 0.0
-
-    def send_heartbeat(self, now: float):
-        if now - self.last_heartbeat_time >= 1.0:
-            self.last_heartbeat_time = now
-            self.mav.mav.heartbeat_send(
-                mavutil.mavlink.MAV_TYPE_GROUND_ROVER,
-                mavutil.mavlink.MAV_AUTOPILOT_GENERIC,
-                0, 0, 0
+class AirsimClient:
+    def __init__(self, vehicle_name="Drone1"):
+        if airsim is None:
+            raise RuntimeError(
+                "airsim package not installed, but MODE='airsim-vision'. "
+                "Install airsim or change MODE."
             )
 
-    def send_state(self, now: float, lat_deg: float, lon_deg: float,
-                   alt_m: float, heading_deg: float, groundspeed_mps: float):
-        """
-        Send GLOBAL_POSITION_INT + VFR_HUD at ~5 Hz to QGC.
-        """
-        # GLOBAL_POSITION_INT
-        if now - self.last_gps_time >= 0.2:
-            self.last_gps_time = now
-            self.mav.mav.global_position_int_send(
-                int(now * 1000),              # time_boot_ms (approx)
-                int(lat_deg * 1e7),
-                int(lon_deg * 1e7),
-                int(alt_m * 1000),            # alt (mm, AMSL)
-                int(alt_m * 1000),            # relative_alt (mm)
-                int(groundspeed_mps * 100),   # vx (cm/s) - just pack total speed into x
-                0,                            # vy
-                0,                            # vz
-                int(heading_deg * 100),       # hdg (cdeg)
-                0
-            )
+        self.client = airsim.MultirotorClient()
+        self.client.confirmConnection()
+        self.client.enableApiControl(True, vehicle_name=vehicle_name)
+        self.client.armDisarm(True, vehicle_name=vehicle_name)
+        self.vehicle = vehicle_name
+        print("[AIRSIM] Connected as", vehicle_name)
 
-        # VFR_HUD
-        if now - self.last_vfr_time >= 0.2:
-            self.last_vfr_time = now
-            self.mav.mav.vfr_hud_send(
-                airspeed=groundspeed_mps,
-                groundspeed=groundspeed_mps,
-                heading=int(heading_deg),
-                throttle=0,
-                alt=alt_m,
-                climb=0.0
-            )
+    def get_drone_position_vec(self) -> np.ndarray:
+        state = self.client.getMultirotorState(vehicle_name=self.vehicle)
+        pos = state.kinematics_estimated.position
+        # AirSim: NED; flip z to get "up"
+        return np.array([pos.x_val, pos.y_val, -pos.z_val], dtype=float)
+
+    def get_rgb_frame(self, camera_name="0") -> Optional[np.ndarray]:
+        resp = self.client.simGetImages(
+            [airsim.ImageRequest(
+                camera_name,
+                airsim.ImageType.Scene,
+                pixels_as_float=False,
+                compress=False,
+            )],
+            vehicle_name=self.vehicle,
+        )[0]
+        if resp.width == 0 or resp.height == 0:
+            return None
+
+        img1d = np.frombuffer(resp.image_data_uint8, dtype=np.uint8)
+        img_bgr = img1d.reshape(resp.height, resp.width, 3)
+        return img_bgr
 
 
 # ---------------------------------------------------------------------------
-# Car simulation
+# Geometry helpers (embedded from geometry.py)
 # ---------------------------------------------------------------------------
 
-class CarSim:
-    """
-    Simulates a car driving at constant speed along a straight road in local frame.
-    Road is defined by an origin point and a heading.
-    """
-    def __init__(self, origin_vec: np.ndarray, heading_deg: float, speed_mps: float):
-        self.origin = np.array(origin_vec, dtype=float)
-        yaw = math.radians(heading_deg)
-        dir_vec = np.array([math.cos(yaw), math.sin(yaw), 0.0], dtype=float)
-        norm = float(np.linalg.norm(dir_vec))
-        if norm < 1e-6:
-            raise ValueError("Invalid road heading: direction vector is zero")
-
-        self.dir_vec = dir_vec / norm
-        self.speed = float(speed_mps)
-
-    def get_state(self, t: float):
-        """
-        Args:
-            t: time since start (seconds)
-        Returns:
-            pos: np.array([x, y, z]) position in local frame
-            vel: np.array([vx, vy, vz]) velocity in local frame
-        """
-        pos = self.origin + self.dir_vec * self.speed * t
-        vel = self.dir_vec * self.speed
-        return pos, vel
-
-
-# ---------------------------------------------------------------------------
-# Sensor geometry & noise
-# ---------------------------------------------------------------------------
-
-def compute_sensor_geometry(rel_vec: np.ndarray):
-    """
-    Compute range and angles from relative vector (car - drone).
-
-    rel_vec: [x, y, z] in local (x=north, y=east, z=up)
-
-    Returns:
-        (R, beta, gamma)
-        R     : range (m)
-        beta  : elevation from nadir (rad). 0 = straight down, pi/2 = horizontal.
-        gamma : azimuth around +Z (rad), 0 = north (+x), pi/2 = east (+y).
-    """
-    x, y, z = float(rel_vec[0]), float(rel_vec[1]), float(rel_vec[2])
-    R = math.sqrt(x * x + y * y + z * z)
-    if R < 1e-6:
-        return None, None, None
-
-    z_down = -z
-    # ratio may have tiny numerical drift; clamp for acos
-    ratio = clamp(z_down / R, -1.0, 1.0)
-    beta = math.acos(ratio)          # angle from nadir
-    gamma = math.atan2(y, x)         # azimuth around +Z
-
-    return R, beta, gamma
+def unit_vector_from_heading_deg(heading_deg: float) -> np.ndarray:
+    rad = math.radians(heading_deg)
+    return np.array([math.cos(rad), math.sin(rad), 0.0], dtype=float)
 
 
 def rel_vec_from_sensor(R: float, beta: float, gamma: float) -> np.ndarray:
     """
-    Inverse of compute_sensor_geometry: recover relative vector from range & angles.
+    Convert sensor measurement (R, beta, gamma) to a 3D vector in local frame.
+
+    Convention (same as geometry.sensor_from_truth):
+      - beta: 0 = nadir (straight down), pi/2 = horizontal
+      - gamma: azimuth in the horizontal plane
     """
-    z_down = R * math.cos(beta)
-    R_xy = R * math.sin(beta)
+    sinb, cosb = math.sin(beta), math.cos(beta)
+    cosg, sing = math.cos(gamma), math.sin(gamma)
 
-    x = R_xy * math.cos(gamma)
-    y = R_xy * math.sin(gamma)
-    z = -z_down  # back to z-up
+    dx = R * sinb * cosg
+    dy = R * sinb * sing
+    dz = -R * cosb
 
-    return np.array([x, y, z], dtype=float)
-
-
-def apply_sensor_noise(R: float, beta: float, gamma: float):
-    """
-    Add Gaussian noise to R, beta, gamma. Clamp range to avoid non-physical values.
-    """
-    # Range noise
-    R_noisy = R + np.random.normal(0.0, RANGE_NOISE_STD_M)
-    # Avoid zero/negative ranges that would flip the vector direction
-    R_noisy = max(0.01, R_noisy)
-
-    # Angle noise
-    beta_noisy = beta + np.random.normal(0.0, math.radians(BETA_NOISE_STD_DEG))
-    gamma_noisy = gamma + np.random.normal(0.0, math.radians(GAMMA_NOISE_STD_DEG))
-
-    return R_noisy, beta_noisy, gamma_noisy
+    return np.array([dx, dy, dz], dtype=float)
 
 
 # ---------------------------------------------------------------------------
-# Speed estimator (regression over history window)
+# Vision model (embedded simplified version of vision_model.py)
+# ---------------------------------------------------------------------------
+
+class VisionMeasurementSource:
+    """
+    Very simple placeholder vision model:
+
+    - Picks a bounding box near the bottom-center of the frame
+      (pretend that's the car).
+    - Uses camera FOV + drone altitude to estimate (R, beta, gamma).
+
+    Replace _dummy_detect_car_bbox() and estimate_measurement()
+    with your real detector (YOLO/TensorRT/etc) when ready.
+    """
+
+    def __init__(self, camera_fov_deg: float = 60.0):
+        self.camera_fov_deg = camera_fov_deg
+
+    def _dummy_detect_car_bbox(self, frame: np.ndarray):
+        """
+        TEMP: returns a bbox in (x_min, y_min, x_max, y_max).
+
+        Right now: central bottom quarter of the frame.
+        """
+        h, w, _ = frame.shape
+        return int(w * 0.25), int(h * 0.5), int(w * 0.75), int(h * 0.9)
+
+    def estimate_measurement(self, frame: np.ndarray, drone_alt_m: float):
+        """
+        Returns (R, beta, gamma) or None if no detection.
+
+        - R: range from drone to car [m]
+        - beta: elevation relative to nadir (down) [rad]
+        - gamma: azimuth around +Z [rad]
+        """
+        h, w, _ = frame.shape
+
+        # In a real system you'd:
+        #   - run detection model,
+        #   - pick best car-like bounding box,
+        #   - use that box for geometry.
+        x_min, y_min, x_max, y_max = self._dummy_detect_car_bbox(frame)
+
+        cx = 0.5 * (x_min + x_max)
+        cy = 0.5 * (y_min + y_max)
+
+        fov_rad = math.radians(self.camera_fov_deg)
+
+        # Vertical offset from image center in [-1, 1]
+        vy = (cy - h / 2.0) / (h / 2.0)
+        # Approx elevation angle offset from optical axis
+        beta = fov_rad * vy
+
+        # Convert to a very rough range estimate:
+        # model: tan(beta_down) = horizontal / altitude
+        beta_down = math.pi / 2.0 - beta
+        horizontal = drone_alt_m * math.tan(beta_down)
+        R = math.sqrt(horizontal ** 2 + drone_alt_m ** 2)
+
+        # Horizontal offset -> azimuth
+        vx = (cx - w / 2.0) / (w / 2.0)
+        gamma = fov_rad * vx
+
+        return R, beta, gamma
+
+
+# ---------------------------------------------------------------------------
+# Speed estimator with ~2 s windowed average along the road
 # ---------------------------------------------------------------------------
 
 class PositionSpeedEstimator:
     """
-    Estimate car speed along the road direction using a history of projected positions.
+    Keeps a sliding window of samples and returns the average speed along
+    the road direction over that window:
 
-    For each sample we store (t, s) where s = dot(car_pos, dir_vec).
-    We then do a least-squares linear fit s(t) ≈ a * t + b and use 'a' as speed.
+        v = (s_last - s_first) / (t_last - t_first)
+
+    where s = projection of car position onto the road direction.
     """
-    def __init__(self, dir_vec: np.ndarray, window_size: int = WINDOW_SIZE):
-        dir_vec = np.array(dir_vec, dtype=float)
-        norm = float(np.linalg.norm(dir_vec))
-        if norm < 1e-6:
-            raise ValueError("Direction vector for speed estimator is zero")
 
-        self.dir_vec = dir_vec / norm
-        self.samples = deque(maxlen=window_size)
+    def __init__(self, road_heading_deg: float, loop_hz: float, window_size: int):
+        self.dir_vec = unit_vector_from_heading_deg(road_heading_deg)
+        self.samples = deque()  # (t, s_along_road)
+        self.window_sec = window_size / loop_hz
 
-    def update(self, t: float, car_pos_vec: np.ndarray):
+    def update(self, t: float, car_pos_vec: np.ndarray) -> Optional[float]:
         s = float(np.dot(car_pos_vec, self.dir_vec))
         self.samples.append((t, s))
-        return self.estimate_speed()
 
-    def estimate_speed(self):
+        # Drop samples older than window_sec
+        t_min = t - self.window_sec
+        while len(self.samples) >= 2 and self.samples[0][0] < t_min:
+            self.samples.popleft()
+
         if len(self.samples) < 2:
             return None
 
-        ts = np.array([t for t, _ in self.samples], dtype=float)
-        ss = np.array([s for _, s in self.samples], dtype=float)
-
-        t0 = ts.mean()
-        ts_centered = ts - t0
-        denom = float((ts_centered ** 2).sum())
-        if denom <= 0.0:
+        t0, s0 = self.samples[0]
+        t1, s1 = self.samples[-1]
+        dt = t1 - t0
+        if dt <= 0:
             return None
 
-        slope = float((ts_centered * ss).sum() / denom)  # m/s along road
-        return slope
+        return (s1 - s0) / dt  # m/s along the road
 
 
 # ---------------------------------------------------------------------------
-# Drone heading / speed helper
+# Heading + drone speed from positions
 # ---------------------------------------------------------------------------
 
-def heading_and_speed_from_velocity(vel: np.ndarray):
+def heading_and_speed_from_positions(
+    prev_pos: Optional[np.ndarray],
+    prev_t: Optional[float],
+    cur_pos: np.ndarray,
+    cur_t: float,
+) -> Tuple[Optional[float], float]:
     """
-    Compute horizontal speed and heading from local velocity.
-
-    vel: [vx, vy, vz] in local (x=north, y=east, z=up)
-
-    Returns:
-        heading_deg: 0° = north, 90° = east
-        speed_mps: horizontal speed in m/s
+    Estimate drone heading (deg) and horizontal speed (m/s)
+    from consecutive position samples.
     """
-    vx = float(vel[0])
-    vy = float(vel[1])
+    if prev_pos is None or prev_t is None:
+        return None, 0.0
+
+    dt = cur_t - prev_t
+    if dt <= 0.0:
+        return None, 0.0
+
+    dpos = cur_pos - prev_pos
+    vx = float(dpos[0]) / dt  # north
+    vy = float(dpos[1]) / dt  # east
     speed = math.hypot(vx, vy)
+
     if speed < 1e-3:
-        # If nearly stationary, keep heading defined but arbitrary
-        heading_rad = 0.0
-    else:
-        heading_rad = math.atan2(vy, vx)
+        return None, 0.0
+
+    heading_rad = math.atan2(vy, vx)  # atan2(east, north)
     heading_deg = (math.degrees(heading_rad) + 360.0) % 360.0
     return heading_deg, speed
 
 
 # ---------------------------------------------------------------------------
-# Main loop
+# Drawing helper
+# ---------------------------------------------------------------------------
+
+def draw_bbox(frame: np.ndarray, bbox, color=(0, 255, 0), thickness=2):
+    if bbox is None:
+        return
+    x_min, y_min, x_max, y_max = bbox
+    cv2.rectangle(frame, (x_min, y_min), (x_max, y_max), color, thickness)
+
+
+# ---------------------------------------------------------------------------
+# Main
 # ---------------------------------------------------------------------------
 
 def main():
-    # Connect to FC and QGC
-    mav_client = MavlinkClient(MAVLINK_CONNECTION)
-    mav_client.get_origin_gps()  # ensure we have origin for local_to_gps
+    print(f"[MAIN] MODE={MODE}, MAVLINK={MAVLINK_CONNECTION}, VIDEO_SOURCE={VIDEO_SOURCE}")
+    timer = LoopTimer(LOOP_HZ)
 
-    car_sim = CarSim(ROAD_ORIGIN_VEC, ROAD_HEADING_DEG, CAR_SPEED_MPS)
-    estimator = PositionSpeedEstimator(car_sim.dir_vec, window_size=WINDOW_SIZE)
+    # Pose + frame source
+    mav = None
+    airsim_client = None
+    cap = None
 
-    qgc_sender = QGCCarSender(QGC_CONNECTION, sysid=CAR_SYSID, compid=CAR_COMPID)
+    if MODE == "camera-vision":
+        mav = MavlinkClient(MAVLINK_CONNECTION)
+        cap = cv2.VideoCapture(VIDEO_SOURCE)
+        if not cap.isOpened():
+            raise RuntimeError(f"Could not open VIDEO_SOURCE={VIDEO_SOURCE}")
 
-    dt_target = 1.0 / LOOP_RATE_HZ
-    t_start = time.time()
+    elif MODE == "airsim-vision":
+        airsim_client = AirsimClient()
+    else:
+        raise RuntimeError(f"Unsupported MODE={MODE}. Use 'camera-vision' or 'airsim-vision'.")
 
-    print("[MAIN] Starting simulation loop...")
-    print(f"[MAIN] Using {'sensor-based' if USE_SENSOR_BASED_ESTIMATE else 'ground-truth'} speed estimation")
+    vision = VisionMeasurementSource()
+    estimator = PositionSpeedEstimator(
+        road_heading_deg=ROAD_HEADING_DEG,
+        loop_hz=LOOP_HZ,
+        window_size=WINDOW_SIZE,
+    )
 
-    while True:
-        loop_start = time.time()
-        sim_t = loop_start - t_start
+    prev_drone_pos = None
+    prev_t = None
 
-        # Get drone state
-        drone_pos, drone_vel = mav_client.get_drone_state(timeout=1.0)
-        drone_alt = float(drone_pos[2])
-        drone_heading_deg, drone_speed_mps = heading_and_speed_from_velocity(drone_vel)
+    try:
+        while True:
+            t_now = time.time()
 
-        # Simulated car state (truth)
-        car_pos_true, car_vel_true = car_sim.get_state(sim_t)
+            # 1) Drone position
+            if MODE == "camera-vision":
+                drone_pos = mav.get_drone_position_vec()
+            else:
+                drone_pos = airsim_client.get_drone_position_vec()
 
-        # Synthetic sensor from drone to car
-        rel_true = car_pos_true - drone_pos
-        R_true, beta_true, gamma_true = compute_sensor_geometry(rel_true)
-        if R_true is None or R_true < MIN_SENSOR_RANGE_M:
-            # Too close or undefined; skip this iteration
-            continue
+            if drone_pos is None:
+                print("[WARN] No drone position yet; skipping this cycle.")
+                timer.sleep_to_rate()
+                continue
 
-        R_meas, beta_meas, gamma_meas = apply_sensor_noise(R_true, beta_true, gamma_true)
-        if R_meas < MIN_SENSOR_RANGE_M:
-            # Even after clamping/noise, treat as invalid
-            continue
+            drone_alt = float(drone_pos[2])
 
-        rel_est = rel_vec_from_sensor(R_meas, beta_meas, gamma_meas)
-        car_pos_est = drone_pos + rel_est
+            # 2) Drone heading + speed
+            drone_heading_deg, drone_speed_mps = heading_and_speed_from_positions(
+                prev_drone_pos, prev_t, drone_pos, t_now
+            )
+            prev_drone_pos = drone_pos.copy()
+            prev_t = t_now
 
-        # Choose what to feed into speed estimator
-        if USE_SENSOR_BASED_ESTIMATE:
-            pos_for_speed = car_pos_est
-        else:
-            pos_for_speed = car_pos_true
+            # 3) Frame
+            if MODE == "camera-vision":
+                ret, frame = cap.read()
+                if not ret:
+                    print("[WARN] Could not read frame from camera; exiting.")
+                    break
+            else:
+                frame = airsim_client.get_rgb_frame()
+                if frame is None:
+                    print("[WARN] AirSim returned empty frame; skipping.")
+                    timer.sleep_to_rate()
+                    continue
 
-        speed_mps_est = estimator.update(sim_t, pos_for_speed)
-        true_speed_mps = CAR_SPEED_MPS
-        true_mph = mps_to_mph(true_speed_mps)
+            # 4) Vision measurement
+            meas = vision.estimate_measurement(frame, drone_alt_m=drone_alt)
+            if meas is None:
+                # No detection, just show frame
+                cv2.imshow("SpeedGun", frame)
+                if cv2.waitKey(1) & 0xFF in (27, ord("q")):
+                    break
+                timer.sleep_to_rate()
+                continue
 
-        est_mph_str = "N/A"
-        over_limit = False
-        speed_err_mph_str = "N/A"
+            R_meas, beta_meas, gamma_meas = meas
 
-        if speed_mps_est is not None:
-            est_mph = mps_to_mph(speed_mps_est)
-            est_mph_str = f"{est_mph:6.2f}"
-            speed_err_mph = est_mph - true_mph
-            speed_err_mph_str = f"{speed_err_mph:+6.2f}"
-            over_limit = est_mph >= (SPEED_LIMIT_MPH + SPEED_LIMIT_MARGIN_MPH)
+            # 5) Back-project to car position in local frame
+            rel_vec = rel_vec_from_sensor(R_meas, beta_meas, gamma_meas)
+            car_pos_est = drone_pos + rel_vec
 
-        # Console output
-        print(
-            f"[t={sim_t:6.2f}s] "
-            f"Drone alt={drone_alt:6.1f} m, hdg={drone_heading_deg:6.1f}°, v={drone_speed_mps:5.2f} m/s | "
-            f"Range true={R_true:6.1f} m | "
-            f"Car true={true_mph:6.2f} mph, est={est_mph_str} mph, err={speed_err_mph_str} mph | "
-            f"{'OVER LIMIT' if over_limit else ''}"
-        )
+            # 6) Speed estimation along road
+            v_road_mps = estimator.update(t_now, car_pos_est)
+            est_mph = None
+            over = False
+            if v_road_mps is not None:
+                est_mph = mps_to_mph(v_road_mps)
+                over = est_mph > (SPEED_LIMIT_MPH + OVER_LIMIT_MARGIN_MPH)
 
-        # Send car state to QGC (truth-based for clean visualization)
-        now = loop_start
-        car_lat, car_lon, car_alt = mav_client.local_to_gps(car_pos_true)
-        car_heading_deg, _ = heading_and_speed_from_velocity(car_vel_true)
-        qgc_sender.send_heartbeat(now)
-        qgc_sender.send_state(now, car_lat, car_lon, car_alt, car_heading_deg, true_speed_mps)
+            # 7) Draw bbox + HUD
+            bbox = vision._dummy_detect_car_bbox(frame)
+            draw_bbox(frame, bbox, color=(0, 255, 0) if not over else (0, 0, 255))
 
-        # Loop timing
-        elapsed = time.time() - loop_start
-        sleep_time = dt_target - elapsed
-        if sleep_time > 0:
-            time.sleep(sleep_time)
+            hud_lines = []
+            hud_lines.append(f"Alt: {drone_alt:4.1f} m")
+            if drone_heading_deg is not None:
+                hud_lines.append(f"Hdg: {drone_heading_deg:5.1f} deg")
+            hud_lines.append(f"Drone spd: {drone_speed_mps:4.1f} m/s")
+            hud_lines.append(f"Range: {R_meas:5.1f} m")
+
+            if est_mph is not None:
+                hud_lines.append(f"Car: {est_mph:5.1f} mph")
+                if over:
+                    hud_lines.append("** OVER LIMIT **")
+
+            y0 = 20
+            for i, text in enumerate(hud_lines):
+                y = y0 + i * 20
+                cv2.putText(
+                    frame,
+                    text,
+                    (10, y),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.5,
+                    (0, 255, 0) if not over else (0, 0, 255),
+                    1,
+                    cv2.LINE_AA,
+                )
+
+            cv2.imshow("SpeedGun", frame)
+            if cv2.waitKey(1) & 0xFF in (27, ord("q")):
+                break
+
+            timer.sleep_to_rate()
+
+    finally:
+        print("[MAIN] Shutting down.")
+        if cap is not None:
+            cap.release()
+        cv2.destroyAllWindows()
 
 
 if __name__ == "__main__":
-    try:
-        main()
-    except KeyboardInterrupt:
-        print("\n[MAIN] Exiting on user interrupt.")
+    main()
