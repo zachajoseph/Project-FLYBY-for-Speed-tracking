@@ -1,27 +1,47 @@
 #!/usr/bin/env python3
 import cv2
-import time
-import os
 from flask import Flask, Response
-
 from V4_drone_speed_gun.vision_model import VisionMeasurementSource
 
 DRONE_ALT_M = 30.0  # pretend drone is 30 m above ground
 
 app = Flask(__name__)
-
-# Change this if your camera index is different
-CAM_SOURCE = 0 
-
-cap = cv2.VideoCapture(CAM_SOURCE, cv2.CAP_V4L2)
-cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
-cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
-
-if not cap.isOpened():
-    print(f"[ERR] Could not open video source: {CAM_SOURCE}")
-    cap = None
-
 vision = VisionMeasurementSource()
+
+def gstreamer_pipeline(
+        sensor_id=0,
+        capture_width=1280,
+        capture_height=720,
+        display_width=1280,
+        display_height=720,
+        framerate=30,
+        flip_method=0,
+):
+    return (
+        "nvarguscamerasrc sensor-id=%d ! "
+        "video/x-raw(memory:NVMM), width=%d, height=%d, framerate=%d/1 ! "
+        "nvvidconv flip-method=%d ! "
+        "video/x-raw, width=%d, height=%d, format=BGRx ! "
+        "videoconvert ! "
+        "video/x-raw, format=BGR ! appsink"
+        % (
+            sensor_id,
+            capture_width,
+            capture_height,
+            framerate,
+            flip_method,
+            display_width,
+            display_height,
+        )
+    )
+
+pipeline = gstreamer_pipeline(sensor_id=0)
+cap = cv2.VideoCapture(pipeline, cv2.CAP_GSTREAMER)
+if not cap.isOpened():
+    print("[ERR] Could not open CSI camera pipeline")
+    cap = None
+else:
+    print("[INFO] CSI pipeline opened")
 
 frame_idx = 0
 
@@ -32,16 +52,14 @@ def generate_frames():
 
     while True:
         ret, frame = cap.read()
-        frame_idx += 1
         if not ret:
             print("[STREAM] Camera error or end of stream.")
             break
 
+        frame_idx += 1
         if frame_idx % 30 == 0:
             print(f"[STREAM] frame {frame_idx}, shape={frame.shape}, mean={frame.mean():.2f}")
 
-
-        # Run detection / measurement
         meas = vision.estimate_measurement(frame, DRONE_ALT_M)
         if meas is not None:
             R, beta, gamma = meas
@@ -51,29 +69,33 @@ def generate_frames():
             text = "No car detected"
             color = (0, 0, 255)
 
-        # Overlay text for visualization
         cv2.putText(frame, text, (10, 30),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
 
-        # Encode as JPEG
-        ret, buffer = cv2.imencode('.jpg', frame)
+        ret, buffer = cv2.imencode(".jpg", frame)
         if not ret:
             continue
-
         frame_bytes = buffer.tobytes()
 
-        # MJPEG stream chunk
-        yield (b'--frame\r\n'
-               b'Content-Type: image/jpeg\r\n\r\n' + frame_bytes + b'\r\n')
+        yield (b"--frame\r\n"
+               b"Content-Type: image/jpeg\r\n\r\n" + frame_bytes + b"\r\n")
 
-@app.route('/video')
+@app.route("/video")
 def video():
     return Response(
         generate_frames(),
-        mimetype='multipart/x-mixed-replace; boundary=frame'
+        mimetype="multipart/x-mixed-replace; boundary=frame"
+    )
+
+@app.route("/")
+def index():
+    return (
+        "<html><body>"
+        "<h2>Flyby Vision Stream</h2>"
+        "<img src='/video' />"
+        "</body></html>"
     )
 
 if __name__ == "__main__":
-    # Bind to 0.0.0.0 so other machines can reach it
     print("[INFO] Starting vision stream on http://0.0.0.0:5000/video")
     app.run(host="0.0.0.0", port=5000, debug=False, threaded=True)
