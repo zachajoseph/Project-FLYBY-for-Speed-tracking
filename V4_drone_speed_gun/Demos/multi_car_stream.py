@@ -16,8 +16,8 @@ DRONE_ALT_M = 30.0          # assumed height for rough speed estimate
 SPEED_LIMIT_MPH = 35.0      # demo speed limit
 HFOV_DEG = 62.0             # Pi v2 approx horizontal FOV
 
-CONF_THRESH = 0.5
-NMS_THRESH = 0.4
+CONF_THRESH = 0.6
+NMS_THRESH = 0.3
 
 VEHICLE_CLASS_IDS = {3, 4, 6, 8}  # COCO: car, motorcycle, bus, truck
 
@@ -187,18 +187,20 @@ def generate_frames():
         # match detections to tracks and estimate speed
         boxes_with_speed = match_tracks(detections, w)
 
-        # draw boxes
-        for box, speed_mph in boxes_with_speed:
+        # draw boxes directly, no tracking / speed
+        for box, cx, cy in detections:
             x, y, bw, bh = box
-            over = speed_mph > SPEED_LIMIT_MPH
-            color = (0, 0, 255) if over else (0, 255, 0)
 
+            # optional: ignore huge boxes that cover most of the frame
+            area = bw * bh
+            if area > 0.8 * w * h:
+                continue  # skip "entire screen" boxes
+
+            color = (0, 255, 0)  # always green for now
             cv2.rectangle(frame, (x, y), (x + bw, y + bh), color, 2)
-            label = f"{speed_mph:4.1f} mph"
-            if over:
-                label += f" > {SPEED_LIMIT_MPH}"
-            cv2.putText(frame, label, (x, max(0, y - 10)),
+            cv2.putText(frame, "car", (x, max(0, y - 10)),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+
 
         # encode and yield
         ret, buffer = cv2.imencode(".jpg", frame)
