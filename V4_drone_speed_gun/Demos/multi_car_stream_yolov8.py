@@ -10,8 +10,8 @@ from ultralytics import YOLO
 # Config
 # ----------------------------
 
-DRONE_ALT_M = 30.0          # unused for now (no speed), kept for future
-CONF_THRESH = 0.45           # YOLO confidence threshold
+DRONE_ALT_M = 30.0          # reserved for future geometry / speed
+CONF_THRESH = 0.45          # YOLO confidence threshold
 NMS_THRESH = 0.45           # IoU threshold
 
 # COCO indices for YOLOv8:
@@ -60,12 +60,103 @@ else:
     print("[INFO] CSI pipeline opened")
 
 # ----------------------------
-# YOLOv8n model
+# YOLOv8s model on CUDA FP16
 # ----------------------------
 
-print("[INFO] Loading YOLOv8n (COCO)...")
+print("[INFO] Loading YOLOv8s (COCO)...")
 model = YOLO("yolov8s.pt")  # will auto-download on first run
-print("[INFO] YOLOv8n loaded")
+
+USE_FP16 = False
+try:
+    model.to("cuda")
+    model.half()            # use FP16 on GPU
+    USE_FP16 = True
+    print("[INFO] YOLOv8s loaded on CUDA in FP16")
+except Exception as e:
+    print("[WARN] Could not enable CUDA/FP16, running on default device:", e)
+    USE_FP16 = False
+
+# ----------------------------
+# Simple temporal tracking (A) + COM
+# ----------------------------
+
+tracks = {}            # track_id -> dict(cx, cy, x1, y1, x2, y2, hits, last_t, conf, cls)
+next_track_id = 1
+MAX_MATCH_DIST = 80.0  # pixels
+MIN_HITS_TO_SHOW = 2   # must be seen in >= this many frames
+MAX_AGE = 0.5          # seconds before track is dropped
+
+
+def update_tracks(detections):
+    """
+    detections: list of (x1, y1, x2, y2, cx, cy, conf, cls)
+    returns: list of (x1, y1, x2, y2, cx, cy, conf, cls) for stable tracks
+    """
+    global tracks, next_track_id
+    now = time.time()
+
+    # mark all tracks as unused this frame
+    for tid in tracks:
+        tracks[tid]["used"] = False
+
+    # associate detections to existing tracks by nearest center
+    for x1, y1, x2, y2, cx, cy, conf, cls in detections:
+        best_id = None
+        best_dist = 1e9
+        for tid, info in tracks.items():
+            dx = cx - info["cx"]
+            dy = cy - info["cy"]
+            dist = math.hypot(dx, dy)
+            if dist < best_dist:
+                best_dist = dist
+                best_id = tid
+
+        if best_id is not None and best_dist < MAX_MATCH_DIST:
+            info = tracks[best_id]
+            info["cx"] = cx
+            info["cy"] = cy
+            info["x1"] = x1
+            info["y1"] = y1
+            info["x2"] = x2
+            info["y2"] = y2
+            info["hits"] += 1
+            info["conf"] = conf
+            info["cls"] = cls
+            info["last_t"] = now
+            info["used"] = True
+        else:
+            tid = next_track_id
+            next_track_id += 1
+            tracks[tid] = {
+                "cx": cx,
+                "cy": cy,
+                "x1": x1,
+                "y1": y1,
+                "x2": x2,
+                "y2": y2,
+                "hits": 1,
+                "conf": conf,
+                "cls": cls,
+                "last_t": now,
+                "used": True,
+            }
+
+    # drop stale tracks
+    dead = [tid for tid, info in tracks.items() if now - info["last_t"] > MAX_AGE]
+    for tid in dead:
+        del tracks[tid]
+
+    # collect stable tracks
+    active = []
+    for info in tracks.values():
+        if info["hits"] >= MIN_HITS_TO_SHOW:
+            active.append(
+                (
+                    info["x1"], info["y1"], info["x2"], info["y2"],
+                    info["cx"], info["cy"], info["conf"], info["cls"],
+                )
+            )
+    return active
 
 # ----------------------------
 # Streaming generator
@@ -83,22 +174,22 @@ def generate_frames():
 
         h, w = frame.shape[:2]
 
-        # Run YOLOv8n inference
+        # Run YOLOv8 inference (Ultralytics handles device/FP16 internally)
         results = model(
             frame,
-            imgsz=960,          # 640 by default; 960 often helps tiny objects
+            imgsz=960,          # higher than 640 to help with small far cars
             conf=CONF_THRESH,
             iou=NMS_THRESH,
             verbose=False,
         )[0]
 
-
-        # Optional geometric filters
-        min_area = 0.002 * w * h
-        max_area = 0.3 * w * h
+        # Geometric filters
+        min_area = 0.0005 * w * h   # allow smaller cars
+        max_area = 0.4 * w * h
         min_aspect = 0.3
         max_aspect = 3.5
 
+        detections = []
         for box in results.boxes:
             cls = int(box.cls[0])
             conf = float(box.conf[0])
@@ -112,17 +203,26 @@ def generate_frames():
             area = bw * bh
             aspect = bh / max(bw, 1)
 
-            # Basic sanity filters
             if not (min_area <= area <= max_area):
                 continue
             if not (min_aspect <= aspect <= max_aspect):
                 continue
-            cy = y1 + bh / 2.0
-            if not (0.3 * h <= cy <= 0.95 * h):
-                continue
 
-            color = (0, 255, 0)  # always green for now
+            cx = x1 + bw / 2.0
+            cy = y1 + bh / 2.0
+
+            detections.append((x1, y1, x2, y2, cx, cy, conf, cls))
+
+        # temporal smoothing + center-of-mass
+        tracks_to_draw = update_tracks(detections)
+
+        # draw stable tracks
+        for x1, y1, x2, y2, cx, cy, conf, cls in tracks_to_draw:
+            color = (0, 255, 0)  # green boxes for now
+
             cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+            # COM marker
+            cv2.circle(frame, (int(cx), int(cy)), 3, (0, 0, 255), -1)
 
             cls_name = model.names.get(cls, "veh")
             label = f"{cls_name} {conf:.2f}"
@@ -153,11 +253,11 @@ def video():
 def index():
     return (
         "<html><body>"
-        "<h2>Flyby YOLOv8n Vehicle Stream</h2>"
+        "<h2>Flyby YOLOv8s Vehicle Stream (tracked)</h2>"
         "<img src='/video' />"
         "</body></html>"
     )
 
 if __name__ == "__main__":
-    print("[INFO] Starting YOLOv8n vehicle stream on http://0.0.0.0:5000")
+    print("[INFO] Starting YOLOv8s vehicle stream on http://0.0.0.0:5000")
     app.run(host="0.0.0.0", port=5000, debug=False, threaded=True)
