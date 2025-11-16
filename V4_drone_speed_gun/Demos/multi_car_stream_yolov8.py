@@ -64,7 +64,7 @@ else:
 # ----------------------------
 
 print("[INFO] Loading YOLOv8s (COCO)...")
-model = YOLO("yolov8s.pt")  # will auto-download on first run
+model = YOLO("yolov8n.pt")
 print("[INFO] YOLOv8s loaded")
 
 
@@ -169,14 +169,12 @@ def generate_frames():
         # Run YOLOv8 inference (device 0 = first CUDA GPU)
         results = model(
             frame,
-            imgsz=960,
+            imgsz=768,
             conf=CONF_THRESH,
             iou=NMS_THRESH,
             device=0,      # use CUDA:0 if available
             verbose=False,
         )[0]
-
-        print(f"[INFO] Model default device: {model.device}")
 
         # Geometric filters
         min_area = 0.0005 * w * h   # allow smaller cars
