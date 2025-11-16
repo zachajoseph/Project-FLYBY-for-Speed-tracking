@@ -18,7 +18,7 @@ NMS_THRESH = 0.45           # IoU threshold
 # 0 person, 1 bicycle, 2 car, 3 motorcycle, 5 bus, 7 truck
 VEHICLE_CLASS_IDS = {2, 3, 5, 7}
 
-SMOOTH_ALPHA = 0.7          # 0.7 = 70% old, 30% new (more smoothing)
+SMOOTH_ALPHA = 0.4          # 40% old, 60% new (more responsive)
 
 app = Flask(__name__)
 
@@ -108,23 +108,37 @@ def update_tracks(detections):
             if dist < best_dist:
                 best_dist = dist
                 best_id = tid
-
         if best_id is not None and best_dist < MAX_MATCH_DIST:
-            # smooth update of an existing track
             info = tracks[best_id]
 
-            info["cx"] = lerp(info["cx"], cx, SMOOTH_ALPHA)
-            info["cy"] = lerp(info["cy"], cy, SMOOTH_ALPHA)
-            info["x1"] = lerp(info["x1"], x1, SMOOTH_ALPHA)
-            info["y1"] = lerp(info["y1"], y1, SMOOTH_ALPHA)
-            info["x2"] = lerp(info["x2"], x2, SMOOTH_ALPHA)
-            info["y2"] = lerp(info["y2"], y2, SMOOTH_ALPHA)
-            info["conf"] = lerp(info["conf"], conf, SMOOTH_ALPHA)
+            # how far did the center move since last frame?
+            move_dist = math.hypot(cx - info["cx"], cy - info["cy"])
+            SNAP_DIST = 40.0  # pixels; tweak as needed
+
+            if move_dist > SNAP_DIST:
+                # big jump: snap to new position so boxes keep up
+                info["cx"] = cx
+                info["cy"] = cy
+                info["x1"] = x1
+                info["y1"] = y1
+                info["x2"] = x2
+                info["y2"] = y2
+                info["conf"] = conf
+            else:
+                # small motion: smooth it
+                info["cx"] = lerp(info["cx"], cx, SMOOTH_ALPHA)
+                info["cy"] = lerp(info["cy"], cy, SMOOTH_ALPHA)
+                info["x1"] = lerp(info["x1"], x1, SMOOTH_ALPHA)
+                info["y1"] = lerp(info["y1"], y1, SMOOTH_ALPHA)
+                info["x2"] = lerp(info["x2"], x2, SMOOTH_ALPHA)
+                info["y2"] = lerp(info["y2"], y2, SMOOTH_ALPHA)
+                info["conf"] = lerp(info["conf"], conf, SMOOTH_ALPHA)
 
             info["hits"] += 1
             info["cls"] = cls
             info["last_t"] = now
             info["used"] = True
+
         else:
             # create a new track, no smoothing yet (first observation)
             tid = next_track_id
