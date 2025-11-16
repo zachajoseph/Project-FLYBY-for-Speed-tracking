@@ -65,16 +65,8 @@ else:
 
 print("[INFO] Loading YOLOv8s (COCO)...")
 model = YOLO("yolov8s.pt")  # will auto-download on first run
+print("[INFO] YOLOv8s loaded")
 
-USE_FP16 = False
-try:
-    model.to("cuda")
-    model.half()            # use FP16 on GPU
-    USE_FP16 = True
-    print("[INFO] YOLOv8s loaded on CUDA in FP16")
-except Exception as e:
-    print("[WARN] Could not enable CUDA/FP16, running on default device:", e)
-    USE_FP16 = False
 
 # ----------------------------
 # Simple temporal tracking (A) + COM
@@ -174,14 +166,17 @@ def generate_frames():
 
         h, w = frame.shape[:2]
 
-        # Run YOLOv8 inference (Ultralytics handles device/FP16 internally)
+        # Run YOLOv8 inference (device 0 = first CUDA GPU)
         results = model(
             frame,
-            imgsz=960,          # higher than 640 to help with small far cars
+            imgsz=960,
             conf=CONF_THRESH,
             iou=NMS_THRESH,
+            device=0,      # use CUDA:0 if available
             verbose=False,
         )[0]
+
+        print(f"[INFO] Model default device: {model.device}")
 
         # Geometric filters
         min_area = 0.0005 * w * h   # allow smaller cars
