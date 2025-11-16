@@ -11,7 +11,7 @@ from ultralytics import YOLO
 # ----------------------------
 
 DRONE_ALT_M = 30.0          # unused for now (no speed), kept for future
-CONF_THRESH = 0.6           # YOLO confidence threshold
+CONF_THRESH = 0.45           # YOLO confidence threshold
 NMS_THRESH = 0.45           # IoU threshold
 
 # COCO indices for YOLOv8:
@@ -64,7 +64,7 @@ else:
 # ----------------------------
 
 print("[INFO] Loading YOLOv8n (COCO)...")
-model = YOLO("yolov8n.pt")  # will auto-download on first run
+model = YOLO("yolov8s.pt")  # will auto-download on first run
 print("[INFO] YOLOv8n loaded")
 
 # ----------------------------
@@ -86,10 +86,12 @@ def generate_frames():
         # Run YOLOv8n inference
         results = model(
             frame,
+            imgsz=960,          # 640 by default; 960 often helps tiny objects
             conf=CONF_THRESH,
             iou=NMS_THRESH,
             verbose=False,
         )[0]
+
 
         # Optional geometric filters
         min_area = 0.002 * w * h
