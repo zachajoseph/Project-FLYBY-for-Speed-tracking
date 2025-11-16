@@ -10,5 +10,4 @@ opencv-python>=4.9
 # AirSim Python client
 airsim>=1.8.1
 
-# Optional: logging / colored output, etc. (you can comment these out)
-rich>=13.7
+
