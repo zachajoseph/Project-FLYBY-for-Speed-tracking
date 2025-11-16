@@ -25,8 +25,9 @@ SPEED_LIMIT_MPH = 35.0
 OVER_LIMIT_MARGIN_MPH = 5.0   # how much over before we flag
 
 # Smoothing / estimator settings
-WINDOW_SIZE = 15              # history length
-LOOP_HZ = 10.0                # main loop rate
+LOOP_HZ = 10.0                # main loop rate (Hz)
+SPEED_WINDOW_SEC = 2.0        # *** window length for speed estimate [s] ***
+HISTORY_LENGTH = 50           # number of (t,s) samples to retain in history
 
 # Sensor model (synthetic range + angles derived from truth)
 RANGE_NOISE_STD_M = 0.5       # m
@@ -233,37 +234,60 @@ class CarSim:
 
 
 # =========================
-# SPEED ESTIMATOR (VECTOR-BASED)
+# SPEED ESTIMATOR (2s WINDOW)
 # =========================
 
 class PositionSpeedEstimator:
     """
     Uses a vector of car positions over time to estimate speed along the road.
-    - Projects car position onto road direction.
-    - Uses finite difference on the last two samples.
+
+    - Projects car position onto road direction (scalar s).
+    - Keeps a history of (t, s).
+    - For each new sample at time t_now, looks back ~SPEED_WINDOW_SEC seconds:
+        v ≈ (s_now - s_old) / (t_now - t_old),
+      where t_old is the oldest sample that is at least window_sec in the past.
     """
-    def __init__(self, road_heading_deg, window_size=15):
+    def __init__(self, road_heading_deg, window_sec, history_length=50):
         self.dir_vec = unit_vector_from_heading_deg(road_heading_deg)
-        self.samples = deque(maxlen=window_size)  # (t, s_along_road_m)
+        self.window_sec = float(window_sec)
+        self.samples = deque(maxlen=history_length)  # (t, s_along_road_m)
 
     def update(self, t, car_pos_vec):
         """
         Add a new (t, car_pos_vec) sample and return estimated
-        road speed in m/s, or None if not enough samples yet.
+        road speed in m/s averaged over ~window_sec, or None if not enough data.
         """
         # Project car position onto road direction (scalar)
         s = float(np.dot(car_pos_vec, self.dir_vec))
-        self.samples.append((t, s))
+        self.samples.append((float(t), s))
 
         if len(self.samples) < 2:
             return None
 
-        (t1, s1), (t2, s2) = self.samples[-2], self.samples[-1]
-        dt = t2 - t1
+        t_now, s_now = self.samples[-1]
+
+        # Find a sample at least window_sec in the past
+        t_old = None
+        s_old = None
+
+        # Scan from oldest to newest to find the earliest sample
+        # that is at least window_sec in the past.
+        for (ti, si) in self.samples:
+            if t_now - ti >= self.window_sec:
+                t_old, s_old = ti, si
+            else:
+                # as soon as we hit one that's too recent, stop
+                break
+
+        # If we don’t yet have a full window, no estimate
+        if t_old is None:
+            return None
+
+        dt = t_now - t_old
         if dt <= 0:
             return None
 
-        v_road_mps = (s2 - s1) / dt
+        v_road_mps = (s_now - s_old) / dt
         return v_road_mps
 
 
@@ -299,7 +323,8 @@ def main():
 
     speed_estimator = PositionSpeedEstimator(
         road_heading_deg=ROAD_HEADING_DEG,
-        window_size=WINDOW_SIZE
+        window_sec=SPEED_WINDOW_SEC,
+        history_length=HISTORY_LENGTH
     )
 
     print("[SIM] Starting loop. Press Ctrl+C to quit.")
@@ -368,6 +393,7 @@ def main():
                 # fallback: use ground-truth car position
                 v_road_mps = speed_estimator.update(t_car, car_pos_true)
 
+            # Only print once we have a full 2s window
             if v_road_mps is not None:
                 est_mph = v_road_mps * 2.23694
                 true_mph = CAR_SPEED_MPS * 2.23694
@@ -379,10 +405,10 @@ def main():
                     heading_str = f"{drone_heading_deg:5.1f}°"
 
                 print(
-                    f"[SpeedGun] "
+                    f"[SpeedGun 2s] "
                     f"Drone (alt {drone_alt:5.1f} m, heading {heading_str}, {drone_speed_mps:4.1f} m/s)   "
                     f"Range ~{R_meas:6.1f} m (true {range_true_m:6.1f} m)   "
-                    f"Car est {est_mph:5.1f} mph   "
+                    f"Car est {est_mph:5.1f} mph (2s avg)   "
                     f"true {true_mph:5.1f} mph   "
                     f"err {err_mph:5.1f} mph   "
                     f"OVER={over}"
