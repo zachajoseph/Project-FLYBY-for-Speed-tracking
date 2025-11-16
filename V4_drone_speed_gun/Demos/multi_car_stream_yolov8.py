@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+import time
+import math
+
 import cv2
 from flask import Flask, Response
 from ultralytics import YOLO
@@ -7,7 +10,7 @@ from ultralytics import YOLO
 # Config
 # ----------------------------
 
-DRONE_ALT_M = 30.0          # reserved for future geometry / speed (unused for now)
+DRONE_ALT_M = 30.0          # reserved for future geometry / speed
 CONF_THRESH = 0.45          # YOLO confidence threshold
 NMS_THRESH = 0.45           # IoU threshold
 
@@ -15,8 +18,7 @@ NMS_THRESH = 0.45           # IoU threshold
 # 0 person, 1 bicycle, 2 car, 3 motorcycle, 5 bus, 7 truck
 VEHICLE_CLASS_IDS = {2, 3, 5, 7}
 
-RUN_EVERY_N_FRAMES = 3      # run YOLO on every 3rd frame
-SMOOTH_ALPHA = 0.7          # 0.7 = 70% previous, 30% new (strong smoothing)
+SMOOTH_ALPHA = 0.7          # 0.7 = 70% old, 30% new (more smoothing)
 
 app = Flask(__name__)
 
@@ -68,14 +70,103 @@ model = YOLO("yolov8n.pt")
 print("[INFO] YOLOv8n loaded")
 
 # ----------------------------
+# Simple temporal tracking (A) + COM (with smoothing)
+# ----------------------------
+
+tracks = {}            # track_id -> dict(cx, cy, x1, y1, x2, y2, hits, last_t, conf, cls)
+next_track_id = 1
+MAX_MATCH_DIST = 80.0  # pixels
+MIN_HITS_TO_SHOW = 2   # must be seen in >= this many frames
+MAX_AGE = 0.5          # seconds before track is dropped
+
+
+def lerp(old, new, alpha):
+    """Linear interpolation: alpha*old + (1-alpha)*new."""
+    return alpha * old + (1.0 - alpha) * new
+
+
+def update_tracks(detections):
+    """
+    detections: list of (x1, y1, x2, y2, cx, cy, conf, cls)
+    returns: list of (x1, y1, x2, y2, cx, cy, conf, cls) for stable tracks
+    """
+    global tracks, next_track_id
+    now = time.time()
+
+    # mark all tracks as unused this frame
+    for tid in tracks:
+        tracks[tid]["used"] = False
+
+    # associate detections to existing tracks by nearest center
+    for x1, y1, x2, y2, cx, cy, conf, cls in detections:
+        best_id = None
+        best_dist = 1e9
+        for tid, info in tracks.items():
+            dx = cx - info["cx"]
+            dy = cy - info["cy"]
+            dist = math.hypot(dx, dy)
+            if dist < best_dist:
+                best_dist = dist
+                best_id = tid
+
+        if best_id is not None and best_dist < MAX_MATCH_DIST:
+            # smooth update of an existing track
+            info = tracks[best_id]
+
+            info["cx"] = lerp(info["cx"], cx, SMOOTH_ALPHA)
+            info["cy"] = lerp(info["cy"], cy, SMOOTH_ALPHA)
+            info["x1"] = lerp(info["x1"], x1, SMOOTH_ALPHA)
+            info["y1"] = lerp(info["y1"], y1, SMOOTH_ALPHA)
+            info["x2"] = lerp(info["x2"], x2, SMOOTH_ALPHA)
+            info["y2"] = lerp(info["y2"], y2, SMOOTH_ALPHA)
+            info["conf"] = lerp(info["conf"], conf, SMOOTH_ALPHA)
+
+            info["hits"] += 1
+            info["cls"] = cls
+            info["last_t"] = now
+            info["used"] = True
+        else:
+            # create a new track, no smoothing yet (first observation)
+            tid = next_track_id
+            next_track_id += 1
+            tracks[tid] = {
+                "cx": cx,
+                "cy": cy,
+                "x1": x1,
+                "y1": y1,
+                "x2": x2,
+                "y2": y2,
+                "hits": 1,
+                "conf": conf,
+                "cls": cls,
+                "last_t": now,
+                "used": True,
+            }
+
+    # drop stale tracks
+    dead = [tid for tid, info in tracks.items() if now - info["last_t"] > MAX_AGE]
+    for tid in dead:
+        del tracks[tid]
+
+    # collect stable tracks
+    active = []
+    for info in tracks.values():
+        if info["hits"] >= MIN_HITS_TO_SHOW:
+            active.append(
+                (
+                    int(info["x1"]), int(info["y1"]),
+                    int(info["x2"]), int(info["y2"]),
+                    int(info["cx"]), int(info["cy"]),
+                    float(info["conf"]), info["cls"],
+                )
+            )
+    return active
+
+# ----------------------------
 # Streaming generator
 # ----------------------------
 
-frame_idx = 0
-last_boxes = []  # list of (x1, y1, x2, y2, cls, conf)
-
 def generate_frames():
-    global frame_idx, last_boxes
     if cap is None:
         return
 
@@ -85,75 +176,58 @@ def generate_frames():
             print("[STREAM] Camera error or end of stream.")
             break
 
-        frame_idx += 1
         h, w = frame.shape[:2]
 
-        run_yolo = (frame_idx % RUN_EVERY_N_FRAMES == 0)
+        # Run YOLOv8 inference (device 0 = first CUDA GPU)
+        results = model(
+            frame,
+            imgsz=768,
+            conf=CONF_THRESH,
+            iou=NMS_THRESH,
+            device=0,      # use CUDA:0 if available
+            verbose=False,
+        )[0]
 
-        if run_yolo:
-            # Run YOLOv8 inference (device 0 = first CUDA GPU)
-            results = model(
-                frame,
-                imgsz=768,
-                conf=CONF_THRESH,
-                iou=NMS_THRESH,
-                device=0,      # use CUDA:0 if available
-                verbose=False,
-            )[0]
+        # Geometric filters
+        min_area = 0.0005 * w * h   # allow smaller cars
+        max_area = 0.4 * w * h
+        min_aspect = 0.3
+        max_aspect = 3.5
 
-            # Geometric filters
-            min_area = 0.0005 * w * h   # allow smaller cars
-            max_area = 0.4 * w * h
-            min_aspect = 0.3
-            max_aspect = 3.5
+        detections = []
+        for box in results.boxes:
+            cls = int(box.cls[0])
+            conf = float(box.conf[0])
 
-            raw_boxes = []
-            for box in results.boxes:
-                cls = int(box.cls[0])
-                conf = float(box.conf[0])
+            if cls not in VEHICLE_CLASS_IDS:
+                continue
 
-                if cls not in VEHICLE_CLASS_IDS:
-                    continue
+            x1, y1, x2, y2 = map(int, box.xyxy[0])
+            bw = x2 - x1
+            bh = y2 - y1
+            area = bw * bh
+            aspect = bh / max(bw, 1)
 
-                x1, y1, x2, y2 = map(int, box.xyxy[0])
-                bw = x2 - x1
-                bh = y2 - y1
-                area = bw * bh
-                aspect = bh / max(bw, 1)
+            if not (min_area <= area <= max_area):
+                continue
+            if not (min_aspect <= aspect <= max_aspect):
+                continue
 
-                if not (min_area <= area <= max_area):
-                    continue
-                if not (min_aspect <= aspect <= max_aspect):
-                    continue
+            cx = x1 + bw / 2.0
+            cy = y1 + bh / 2.0
 
-                raw_boxes.append((x1, y1, x2, y2, cls, conf))
+            detections.append((x1, y1, x2, y2, cx, cy, conf, cls))
 
-            # --- simple smoothing vs previous frame's boxes ---
-            smoothed = []
-            for i, (x1, y1, x2, y2, cls, conf) in enumerate(raw_boxes):
-                if i < len(last_boxes) and last_boxes[i][4] == cls:
-                    px1, py1, px2, py2, pcl, pconf = last_boxes[i]
-                    sx1 = int(SMOOTH_ALPHA * px1 + (1.0 - SMOOTH_ALPHA) * x1)
-                    sy1 = int(SMOOTH_ALPHA * py1 + (1.0 - SMOOTH_ALPHA) * y1)
-                    sx2 = int(SMOOTH_ALPHA * px2 + (1.0 - SMOOTH_ALPHA) * x2)
-                    sy2 = int(SMOOTH_ALPHA * py2 + (1.0 - SMOOTH_ALPHA) * y2)
-                    sconf = SMOOTH_ALPHA * pconf + (1.0 - SMOOTH_ALPHA) * conf
-                    smoothed.append((sx1, sy1, sx2, sy2, cls, sconf))
-                else:
-                    # no previous box to smooth with, just use raw
-                    smoothed.append((x1, y1, x2, y2, cls, conf))
+        # temporal smoothing + center-of-mass
+        tracks_to_draw = update_tracks(detections)
 
-            last_boxes = smoothed
+        # draw stable smoothed tracks
+        for x1, y1, x2, y2, cx, cy, conf, cls in tracks_to_draw:
+            color = (0, 255, 0)  # green boxes for now
 
-        # draw last_boxes on current frame (even if YOLO skipped this frame)
-        for x1, y1, x2, y2, cls, conf in last_boxes:
-            color = (0, 255, 0)
             cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
-
-            # simple center marker
-            cx = (x1 + x2) // 2
-            cy = (y1 + y2) // 2
-            cv2.circle(frame, (cx, cy), 3, (0, 0, 255), -1)
+            # COM marker
+            cv2.circle(frame, (int(cx), int(cy)), 3, (0, 0, 255), -1)
 
             cls_name = model.names.get(cls, "veh")
             label = f"{cls_name} {conf:.2f}"
@@ -184,7 +258,7 @@ def video():
 def index():
     return (
         "<html><body>"
-        "<h2>Flyby YOLOv8n Vehicle Stream</h2>"
+        "<h2>Flyby YOLOv8n Vehicle Stream (smoothed)</h2>"
         "<img src='/video' />"
         "</body></html>"
     )
