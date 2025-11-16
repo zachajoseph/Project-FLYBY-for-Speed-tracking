@@ -11,10 +11,12 @@ DRONE_ALT_M = 30.0  # pretend drone is 30 m above ground
 app = Flask(__name__)
 
 # Change this if your camera index is different
-CAM_SOURCE = 0
+CAM_SOURCE = 0 
 
-# Global camera + model
-cap = cv2.VideoCapture(CAM_SOURCE)
+cap = cv2.VideoCapture(CAM_SOURCE, cv2.CAP_V4L2)
+cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
+cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+
 if not cap.isOpened():
     print(f"[ERR] Could not open video source: {CAM_SOURCE}")
     cap = None
